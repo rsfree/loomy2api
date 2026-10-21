@@ -49,7 +49,7 @@ Loomy2API 是一个自托管的**反向代理网关**，把讯飞 Loomy（`loomy
   （`session`），并用它作为上游 Bearer token；
 - 面向**个人多账号**场景：多号共享、单号故障自动换号、冷却 / 熔断防雪崩、会话粘性保证多轮不跳号；
 - 对客户端暴露 `chat_completions`、`codex_responses` 与 `anthropic_messages`，
-  模型名原样交给上游；图像模型自动分道到 `/v1/images/generations`。
+  模型名按上游目录归一（精确匹配优先，其次最长前缀）；图像模型自动分道到 `/v1/images/generations`。
 
 协议细节（签名算法、登录信封、模型目录口径、积分结算）见 **[docs/PROTOCOL.md](docs/PROTOCOL.md)**。
 
@@ -62,6 +62,7 @@ Loomy2API 是一个自托管的**反向代理网关**，把讯飞 Loomy（`loomy
 | 🎁 **新手任务直领** | 上游 8 项新手任务合计 **10000 积分**，服务端**不校验前置行为**，纯 API 直领、零 token 消耗；面板「任务中心」展示账号 × 任务矩阵 |
 | 🚫 **失效模型台账** | 上游对下架模型回 404，与账号无关。网关记成**模型级**台账（30 天 TTL），期间 `/v1/models` 隐藏、请求直接 404，**不罚账号** |
 | 🔒 **严格模型校验** | Loomy 对认不出的模型名**不报错**，而是静默用默认模型执行并回 200（实测 `no-such-model-xyz` → 响应 `model` 变成 `DeepSeek-V4.1-Flash`，按默认模型扣分）。网关在目录层直接 404，客户端拿不到「成功的错答案」 |
+| 🧩 **模型名别名** | 请求名先归一成目录里的标准 id：**精确匹配优先**，否则取**最长前缀**（`deepseek-v4.1-flash-xxx` → `DeepSeek-V4.1-Flash`）。前缀后必须是分隔符，拼错的名字（`spark-xylophone`）仍 404，并在文案里提示最接近的模型 |
 | 🆓 **限免与倍率识别** | 上游 `/models` 没有结构化倍率字段，倍率与「限时免费」都写在展示名里（`Spark-X2.6-preview(限时免费)(x0.0)`），网关解析后由面板渲染「限免」标签 |
 | 🖼️ **图像模型多端点** | `type=image` 的模型支持 `/v1/images/generations`、`/v1/images/edits`（multipart / JSON），也可走 `/v1/chat/completions` 与 `/v1/responses` 前门（自动折成 prompt + 参考图），支持单图与**多图数组** |
 | 🔄 **多账号池** | 余额加权 + 成本分层 + 加权随机选号，Top-5 候选 + 防惊群；**每日赠送额度优先**（按自然日清零的那份先花） |
@@ -211,7 +212,7 @@ curl http://127.0.0.1:17890/v1/responses \
 | `max_inflight_per_account` | `0` | 单号在途上限（0 = 不限） |
 | `balance_floor` | `0` | 积分保底：可用积分 ≤ 此值停止接单（0 = 关闭） |
 | `prefer_daily_quota` | `true` | 优先花每日赠送额度，再动长期积分 |
-| `strict_model_check` | `true` | 不在目录里的模型直接 404，不打上游 |
+| `strict_model_check` | `true` | 不在目录里的模型直接 404，不打上游（目录匹配支持最长前缀别名） |
 | `dead_model_ttl_days` | `30` | 失效模型台账 TTL |
 | `sticky_ttl_seconds` | `1800` | 会话粘性 TTL（0 = 关闭） |
 | `soft_rate_base_seconds` / `_max_` | `600` / `7200` | 429 软冷却基数与封顶 |

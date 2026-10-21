@@ -1072,21 +1072,24 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------- 工具函数
 
 func (h *Handler) resolveModel(ctx context.Context, payload map[string]any) string {
-	model := str(payload["model"])
+	model := strings.TrimSpace(str(payload["model"]))
 	if model == "" {
 		model = h.Cfg.DefaultModel
 	}
-	if h.Cfg.StripPrefix {
-		// 接受 "imodel/spark-x" 形态；上游本身也用 provider/model，
-		// 所以只在缺前缀时补，不强行剥掉。
+
+	// 先按目录归一：精确优先，其次最长前缀（deepseek-v4.1-flash-xxx →
+	// DeepSeek-V4.1-Flash）。归一后下游的 imageOnlyModel / 严格校验 / 下架台账
+	// / 发往上游的 model 字段全都用同一个标准 id，不必各自处理别名。
+	if m, ok := h.matchModel(ctx, model); ok {
+		model = m.ID
+	} else if h.Cfg.StripPrefix && !strings.Contains(model, "/") {
+		// 目录里没有：保持旧行为，裸 id 补 provider 前缀，交给严格校验或上游处理。
 		//
-		// 但不能无脑补：上游 /models 现在给的是裸 id（spark-x、DeepSeek-V4.1-Flash），
-		// 我们对外的 /v1/models 原样透出这些 id；如果这里再补 imodel/，上游认不出
-		// 就会**静默回落到默认模型**（客户端以为在用 spark-x，实际扣的是 DeepSeek 的
-		// 积分，且响应里 model 字段会变）。所以已知的裸 id 一律不补前缀。
-		if !strings.Contains(model, "/") && !h.knownModel(ctx, model) {
-			model = "imodel/" + model
-		}
+		// 不能无脑补：上游 /models 给的是裸 id（spark-x、DeepSeek-V4.1-Flash），
+		// 补了前缀上游认不出就会**静默回落到默认模型**（客户端以为在用 spark-x，
+		// 实际扣的是默认模型的积分，响应里 model 字段也会变）。所以命中目录的
+		// 一律原样用目录 id。
+		model = modelProviderPrefix + model
 	}
 	if payload != nil {
 		payload["model"] = model
@@ -1120,25 +1123,17 @@ func (h *Handler) WarmCatalog(ctx context.Context) int {
 	return len(h.Models.Get(ctx, h.anySession()))
 }
 
-// knownModel 判断裸 id 是否就是上游目录里的模型（命中则不补 imodel/ 前缀）。
-// 目录拉不到时返回 false，退回旧的补前缀行为。
-func (h *Handler) knownModel(ctx context.Context, id string) bool {
-	for _, m := range h.catalog(ctx) {
-		if m.ID == id {
-			return true
-		}
-	}
-	return false
+// matchModel 在目录里解析模型名（精确优先，其次最长前缀）。
+// 目录拉不到时返回 false，调用方退回旧行为（补前缀 / 放行）。
+func (h *Handler) matchModel(ctx context.Context, model string) (config.Model, bool) {
+	return matchCatalog(h.catalog(ctx), model)
 }
 
 // imageOnlyModel 判断模型是否只能走生图端点（上游目录里 type=image）。
 // 目录拉不到时返回 false：宁可放行让上游自己判定，也不臆测模型类型。
 func (h *Handler) imageOnlyModel(ctx context.Context, model string) bool {
-	id := strings.TrimPrefix(model, "imodel/")
-	for _, m := range h.catalog(ctx) {
-		if strings.EqualFold(m.ID, id) {
-			return m.IsImage()
-		}
+	if m, ok := h.matchModel(ctx, model); ok {
+		return m.IsImage()
 	}
 	return false
 }
@@ -1160,11 +1155,8 @@ func (h *Handler) catalogHas(ctx context.Context, model string) bool {
 	if len(list) == 0 {
 		return true // 目录还没拉到：放行，由上游自己判
 	}
-	id := strings.TrimPrefix(model, "imodel/")
-	for _, m := range list {
-		if strings.EqualFold(strings.TrimPrefix(m.ID, "imodel/"), id) {
-			return true
-		}
+	if _, ok := matchCatalog(list, model); ok {
+		return true
 	}
 	return false
 }
@@ -1184,9 +1176,12 @@ func (h *Handler) rejectUnknownModel(w http.ResponseWriter, model string) bool {
 	}
 	// 文案里用客户端原本写的名字（resolveModel 可能补过 imodel/ 前缀，回显前缀
 	// 会让用户以为是自己的模型名写错了）。
-	writeErr(w, http.StatusNotFound,
-		"上游没有模型 "+strings.TrimPrefix(model, "imodel/")+"；可用模型见 GET /v1/models",
-		"not_found_error")
+	_, base := splitModelPrefix(model)
+	msg := "上游没有模型 " + base + "；可用模型见 GET /v1/models"
+	if sug := suggestModels(h.Models.Cached(), model, 3); len(sug) > 0 {
+		msg += "。最接近：" + strings.Join(sug, "、")
+	}
+	writeErr(w, http.StatusNotFound, msg, "not_found_error")
 	return true
 }
 
