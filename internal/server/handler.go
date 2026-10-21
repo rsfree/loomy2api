@@ -1112,7 +1112,7 @@ func (h *Handler) catalog(ctx context.Context) []config.Model {
 
 // WarmCatalog 用任一可用登录态把模型目录拉进缓存，返回条目数。
 //
-// 必须在启动时调一次（见 cmd/server）：knownModel（裸 id 不补前缀）与
+// 必须在启动时调一次（见 cmd/server）：matchModel（精确 / 最长前缀归一）与
 // imageOnlyModel（图像模型不进对话端点）都依赖目录里的元数据，冷缓存下
 // 两者都会误判，而上游对认不出的模型名不会报错——它静默回落到默认模型
 // （实测响应里 model 变成 DeepSeek-V4.1-Flash，扣的是默认模型的积分）。
