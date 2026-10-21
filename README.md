@@ -171,7 +171,9 @@ curl http://127.0.0.1:17890/v1/responses \
 | POST | `/v1/messages` | Anthropic | Claude Code 等（也接受 `/messages`） |
 | GET | `/v1/models` | OpenAI | 模型目录（上游优先，失败回落内置表）；图像模型带 `endpoint` / `supports_chat=false` |
 | POST | `/v1/embeddings` | OpenAI | 向量 |
-| POST | `/v1/images/generations` | OpenAI | 生图 |
+| POST | `/v1/images/generations` | OpenAI | 生图 / 图生图（`image` 支持 URL、data URI、**数组多图**） |
+| POST | `/v1/images/edits` | OpenAI | 同上，multipart 前门（`image` / `image[]` 文件、`mask`） |
+| POST | `/v1/images/variations` | OpenAI | edits 的旧端点别名 |
 | POST | `/v1/search` | — | 内置联网检索通道 |
 | GET | `/v1/points` | — | 全池额度 |
 | GET | `/status` | — | 账号池状态（需鉴权） |

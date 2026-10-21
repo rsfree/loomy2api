@@ -3,8 +3,10 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -928,6 +930,107 @@ func TestEmbeddings404DoesNotHideChatModel(t *testing.T) {
 	h.Routes().ServeHTTP(w, req)
 	if !strings.Contains(w.Body.String(), "spark-x2.6") {
 		t.Errorf("/v1/models 不应隐藏 spark-x2.6：%s", w.Body.String())
+	}
+}
+
+// TestImageEditsJSONMulti 生图 edits 的 JSON 前门：image 数组原样进 canonical body。
+func TestImageEditsJSONMulti(t *testing.T) {
+	fs := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"Hy-Image-3.5-preview","type":"image"}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"created":1,"data":[{"url":"https://example.com/x.png"}],"points_consumed":110}`)
+	})
+	h, p, _ := newTestHandler(t, fs.srv.URL, nil)
+	if list := h.Models.Get(context.Background(), "sess"); len(list) != 1 {
+		t.Fatalf("目录预热失败：%d 个模型", len(list))
+	}
+
+	body := `{"model":"Hy-Image-3.5-preview","prompt":"把两张图拼一起","image":["https://a/1.png","https://a/2.png"],"size":"1024x1024"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 %d：%s", w.Code, w.Body.String())
+	}
+	sent := fs.bodies[len(fs.bodies)-1]
+	if !strings.Contains(sent, `"image":["https://a/1.png","https://a/2.png"]`) {
+		t.Errorf("多图没有原样转发：%s", sent)
+	}
+	if len(p.All()) != 1 || p.All()[0].PointsUsed != 110 {
+		t.Errorf("生图扣分未入账：%+v", p.All()[0].PointsUsed)
+	}
+}
+
+// TestImageEditsMultipartTwoFiles multipart 的 image[] 要按顺序转成 data URI 数组。
+func TestImageEditsMultipartTwoFiles(t *testing.T) {
+	fs := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"Hy-Image-3.5-preview","type":"image"}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"created":1,"data":[{"url":"https://example.com/x.png"}],"points_consumed":110}`)
+	})
+	h, _, _ := newTestHandler(t, fs.srv.URL, nil)
+	if list := h.Models.Get(context.Background(), "sess"); len(list) != 1 {
+		t.Fatalf("目录预热失败：%d 个模型", len(list))
+	}
+
+	png, _ := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("model", "Hy-Image-3.5-preview")
+	_ = mw.WriteField("prompt", "两张图合成")
+	_ = mw.WriteField("size", "1024x1024")
+	for i := 0; i < 2; i++ {
+		fw, err := mw.CreateFormFile("image[]", "ref.png")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = fw.Write(png)
+	}
+	_ = mw.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 %d：%s", w.Code, w.Body.String())
+	}
+	sent := fs.bodies[len(fs.bodies)-1]
+	if strings.Count(sent, "data:image/png;base64,") != 2 {
+		t.Errorf("应转出两张 data URI：%s", sent)
+	}
+	if !strings.Contains(sent, `"image":["data:image/png;base64,`) {
+		t.Errorf("多图没有按数组转发：%s", sent)
+	}
+}
+
+// TestImageEditsRejectsEmptyImage edits 没有参考图要 400，且不打上游。
+func TestImageEditsRejectsEmptyImage(t *testing.T) {
+	fs := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"Hy-Image-3.5-preview","type":"image"}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"created":1,"data":[]}`)
+	})
+	h, _, _ := newTestHandler(t, fs.srv.URL, nil)
+	before := len(fs.seen)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits",
+		strings.NewReader(`{"model":"Hy-Image-3.5-preview","prompt":"x"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("状态码 %d，期望 400", w.Code)
+	}
+	if len(fs.seen) != before {
+		t.Errorf("400 的请求不该打上游")
 	}
 }
 

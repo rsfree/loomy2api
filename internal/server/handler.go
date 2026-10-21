@@ -60,6 +60,9 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("/messages", h.withAuth(h.anthropicMessages))
 	mux.HandleFunc("/v1/embeddings", h.withAuth(h.passthrough("embeddings", "embed")))
 	mux.HandleFunc("/v1/images/generations", h.withAuth(h.passthrough("images/generations", "image")))
+	// edits / variations 是同一语义的 multipart 前门（见 imagefront.go）。
+	mux.HandleFunc("/v1/images/edits", h.withAuth(h.imageEdits))
+	mux.HandleFunc("/v1/images/variations", h.withAuth(h.imageEdits))
 	mux.HandleFunc("/v1/search", h.withAuth(h.search))
 	mux.HandleFunc("/v1/models", h.withAuth(h.listModels))
 	mux.HandleFunc("/v1/points", h.withAuth(h.points))
@@ -384,7 +387,7 @@ func (h *Handler) chatOnce(w http.ResponseWriter, r *http.Request, req map[strin
 			h.Pool.Release(acc)
 			h.Pool.ReportFailure(acc, 0, err.Error(), skey, model)
 			lastStatus, lastBody = http.StatusBadGateway, err.Error()
-			h.logCall(acc, model, 0, time.Since(started), "sync 连接异常: "+err.Error())
+			h.logCall(acc, model, 0, time.Since(started), "sync 连接异常: "+err.Error(), h.requestIP(r))
 			continue
 		}
 		body := resp.BodyText()
@@ -410,7 +413,7 @@ func (h *Handler) chatOnce(w http.ResponseWriter, r *http.Request, req map[strin
 				Points: pts, LatencyMs: time.Since(started).Milliseconds(),
 				ClientIP: clientIP(r), UserAgent: ua(r), RequestID: rid(resp.Header),
 			})
-			h.logCall(acc, model, 200, time.Since(started), usageSummary(prompt, completion, pts, reasoning))
+			h.logCall(acc, model, 200, time.Since(started), usageSummary(prompt, completion, pts, reasoning), h.requestIP(r))
 			w.Header().Set("X-Loomy-Account", acc.Name)
 			if id := rid(resp.Header); id != "" {
 				w.Header().Set("X-Request-Id", id)
@@ -425,7 +428,7 @@ func (h *Handler) chatOnce(w http.ResponseWriter, r *http.Request, req map[strin
 		lastStatus, lastBody = resp.Status, body
 		fault := pool.Classify(resp.Status, body)
 		h.Pool.ReportFailure(acc, resp.Status, body, skey, model)
-		h.logCall(acc, model, resp.Status, time.Since(started), "上游返回，换号重试")
+		h.logCall(acc, model, resp.Status, time.Since(started), "上游返回，换号重试", h.requestIP(r))
 		if pool.FatalRequest(fault) {
 			break
 		}
@@ -488,7 +491,7 @@ func (h *Handler) chatAggregated(w http.ResponseWriter, r *http.Request, req map
 		}})
 		return
 	}
-	h.logCall(nil, model, 200, time.Since(started), "流式聚合（长任务）")
+	h.logCall(nil, model, 200, time.Since(started), "流式聚合（长任务）", h.requestIP(r))
 	buf, _ := json.Marshal(obj)
 	_, _ = w.Write(buf)
 }
@@ -667,7 +670,7 @@ func (h *Handler) chatStream(w http.ResponseWriter, r *http.Request, req map[str
 		LatencyMs: elapsed.Milliseconds(), TTFBMs: ttfb,
 		ClientIP: clientIP(r), UserAgent: ua(r),
 	})
-	h.logStream(lastAcc, model, elapsed, ttfb, completion, reasoning, pts)
+	h.logStream(lastAcc, model, elapsed, ttfb, completion, reasoning, pts, h.requestIP(r))
 }
 
 // responses POST /v1/responses（Codex Responses API → chat completions）。
@@ -804,7 +807,7 @@ func (h *Handler) responsesStream(w http.ResponseWriter, r *http.Request, chatRe
 		LatencyMs: time.Since(started).Milliseconds(),
 		ClientIP:  clientIP(r), UserAgent: ua(r),
 	})
-	h.logStream(acc, model, time.Since(started), 0, completion, reasoning, pts)
+	h.logStream(acc, model, time.Since(started), 0, completion, reasoning, pts, h.requestIP(r))
 }
 
 // anthropicMessages POST /v1/messages。
@@ -1228,7 +1231,16 @@ func (h *Handler) fail(w http.ResponseWriter, r *http.Request, kind, model strin
 	h.writeUpstreamError(w, status, body)
 }
 
-func (h *Handler) logCall(acc *pool.Account, model string, status int, d time.Duration, note string) {
+// requestIP 仅在 log_client_info 打开时返回来源 IP，供「运行日志」核对
+// 客户端是否走了预期出口（代理是否生效）。
+func (h *Handler) requestIP(r *http.Request) string {
+	if h.Cfg == nil || !h.Cfg.SendClientInfo || r == nil {
+		return ""
+	}
+	return clientIP(r)
+}
+
+func (h *Handler) logCall(acc *pool.Account, model string, status int, d time.Duration, note, ip string) {
 	if !h.Cfg.LogRequests {
 		return
 	}
@@ -1237,12 +1249,15 @@ func (h *Handler) logCall(acc *pool.Account, model string, status int, d time.Du
 		name = acc.Name
 	}
 	seq := h.reqSeq.Add(1)
+	if ip != "" {
+		note = strings.TrimSpace(note + " ip=" + ip)
+	}
 	log.Printf("| #%03d | %s | %-11s | %3d | %s | %6dms | %s |",
 		seq, time.Now().Format("15:04:05"), truncate(model, 11), status,
 		truncate(name, 20), d.Milliseconds(), note)
 }
 
-func (h *Handler) logStream(acc *pool.Account, model string, d time.Duration, ttfbMs, completion, reasoning, pts int64) {
+func (h *Handler) logStream(acc *pool.Account, model string, d time.Duration, ttfbMs, completion, reasoning, pts int64, ip string) {
 	if !h.Cfg.LogRequests {
 		return
 	}
@@ -1258,6 +1273,9 @@ func (h *Handler) logStream(acc *pool.Account, model string, d time.Duration, tt
 	extra := ""
 	if reasoning > 0 {
 		extra = fmt.Sprintf(" think=%d", reasoning)
+	}
+	if ip != "" {
+		extra += " ip=" + ip
 	}
 	log.Printf("| #%03d | %s | %-11s | stream | 200 | %s | TTFB=%dms | tok=%d%s | %s | total=%s |",
 		seq, time.Now().Format("15:04:05"), truncate(model, 11), truncate(name, 20),
