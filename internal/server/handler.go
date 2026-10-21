@@ -1020,6 +1020,10 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 					LatencyMs: time.Since(started).Milliseconds(),
 					ClientIP:  clientIP(r), UserAgent: ua(r),
 				})
+				// passthrough（生图/embeddings/search）也要进「运行日志」：
+				// 否则面板看不到这些请求，更没法核对来源 IP / 代理是否生效。
+				h.logCall(acc, model, 200, time.Since(started),
+					usageSummary(prompt, completion, pts, reasoning), h.requestIP(r))
 				w.Header().Set("Content-Type", "application/json; charset=utf-8")
 				w.Header().Set("X-Loomy-Account", acc.Name)
 				w.WriteHeader(200)
