@@ -60,9 +60,8 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("/messages", h.withAuth(h.anthropicMessages))
 	mux.HandleFunc("/v1/embeddings", h.withAuth(h.passthrough("embeddings", "embed")))
 	mux.HandleFunc("/v1/images/generations", h.withAuth(h.passthrough("images/generations", "image")))
-	// edits / variations 是同一语义的 multipart 前门（见 imagefront.go）。
+	// edits 是 generations 的 multipart 前门（见 imagefront.go）。
 	mux.HandleFunc("/v1/images/edits", h.withAuth(h.imageEdits))
-	mux.HandleFunc("/v1/images/variations", h.withAuth(h.imageEdits))
 	mux.HandleFunc("/v1/search", h.withAuth(h.search))
 	mux.HandleFunc("/v1/models", h.withAuth(h.listModels))
 	mux.HandleFunc("/v1/points", h.withAuth(h.points))

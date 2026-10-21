@@ -27,7 +27,6 @@ import (
 const maxImagePart = 20 << 20
 
 // imageEdits POST /v1/images/edits：OpenAI multipart 前门（也接受 JSON）。
-// variations 是同一语义的旧端点，直接复用。
 func (h *Handler) imageEdits(w http.ResponseWriter, r *http.Request) {
 	h.imageFront(w, r, true)
 }
@@ -74,7 +73,7 @@ func parseImageFront(r *http.Request, requireImage bool) (map[string]any, error)
 		return nil, err
 	}
 	if len(images) == 0 && requireImage {
-		return nil, fmt.Errorf("image 不能为空：edits / variations 需要至少一张参考图")
+		return nil, fmt.Errorf("image 不能为空：edits 需要至少一张参考图")
 	}
 	switch len(images) {
 	case 0:
@@ -180,7 +179,7 @@ func parseMultipartImage(r *http.Request, requireImage bool) (map[string]any, er
 	}
 
 	if len(images) == 0 && requireImage {
-		return nil, fmt.Errorf("image 不能为空：edits / variations 需要至少一张参考图")
+		return nil, fmt.Errorf("image 不能为空：edits 需要至少一张参考图")
 	}
 	switch len(images) {
 	case 0:
