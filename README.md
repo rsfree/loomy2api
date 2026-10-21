@@ -296,6 +296,22 @@ docker compose up -d
 - **出口**：真正决定风控画像的是网络出口。`proxy` 支持全局与账号级覆盖；
   账号级优先，适合给不同账号分配不同出口。
 
+### 发版
+
+版本只存在于 git tag，不写回代码。三种入口：
+
+| 触发 | 行为 |
+|---|---|
+| push `main` | 读最新版本 tag，patch 自增（`v0.0.1 → v0.0.2`），自动打 tag、建 Release |
+| push `vX.Y.Z` tag | 人工指定版本（minor / major 用），不递增 |
+| Actions → Release → Run workflow | 输入已存在的 tag 补发（镜像或 Release 失败后重跑） |
+
+每次发布产出五平台二进制 + `SHA256SUMS.txt`，以及 `ghcr.io/rsfree/loomy2api` 的
+`:<version>` / `:sha-<7位>` 多架构镜像（amd64 + arm64）；只有 main 自增路径会移动 `:latest`。
+镜像先本地起容器冒烟，`/healthz` 返回带 `service=loomy2api` 才推送——冒烟不过，GHCR 见不到坏镜像。
+
+commit message 含 `[skip release]` 时只跑测试，不出版本、不推镜像。
+
 ## 开发与测试
 
 ```bash

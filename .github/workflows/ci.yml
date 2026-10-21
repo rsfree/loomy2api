@@ -54,6 +54,8 @@ jobs:
     name: docker build
     runs-on: ubuntu-latest
     needs: test
+    # main / tag 上的镜像由 release 工作流统一构建并推送，这里只在 PR 上验证 Dockerfile
+    if: github.event_name == 'pull_request'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -63,11 +65,17 @@ jobs:
 
       - name: Smoke test image
         run: |
-          # 起容器，验 /healthz 能回（无账号时应为 503，带 service 字段即可）
-          docker run -d --name smoke -p 17890:17890 loomy2api:ci -config /data/config.json || true
-          sleep 5
-          code=$(curl -s -o /tmp/h.json -w '%{http_code}' http://127.0.0.1:17890/healthz || echo 000)
+          set -euo pipefail
+          docker run -d --name smoke -p 17890:17890 loomy2api:ci
+          trap 'docker logs smoke || true; docker rm -f smoke || true' EXIT
+
+          ok=0
+          for i in $(seq 1 20); do
+            code=$(curl -s -o /tmp/h.json -w '%{http_code}' http://127.0.0.1:17890/healthz || true)
+            if [ "$code" = "200" ] || [ "$code" = "503" ]; then ok=1; break; fi
+            sleep 1
+          done
           echo "healthz status=$code body=$(cat /tmp/h.json 2>/dev/null)"
-          grep -q loomy2api /tmp/h.json
-          docker logs smoke
-          docker rm -f smoke
+          [ "$ok" = "1" ] || { echo "::error::/healthz 20s 内未就绪"; exit 1; }
+          # 无账号时按设计 503；判据是身份字段
+          grep -q '"service":"loomy2api"' /tmp/h.json

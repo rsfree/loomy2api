@@ -1,100 +1,337 @@
 name: Release
 
-# 版本标签用上海时间，形如 v2026.10.19.1430（时不补零、分两位、不带秒）。
-# 本机（Windows / git-bash）没有 tzdata，`TZ=Asia/Shanghai date` 会静默回落 UTC
-# 导致标签早 8 小时，所以打标签用显式加 8 小时的写法：
+# 混合发版模型：
+#   ① push main           → 读最新版本 tag，patch 自增（v0.0.1 → v0.0.2）
+#   ② push vX.Y.Z tag     → 人工指定版本，不递增（用于 minor / major）
+#   ③ workflow_dispatch   → 给已存在的 tag 补发（镜像失败、Release 漏建等）
 #
-#   VERSION=$(TZ=Asia/Shanghai date +%Y.%-m.%-d.%-H%M)
-#   [ "$(TZ=UTC date +%H)" = "$(TZ=Asia/Shanghai date +%H)" ] \
-#     && VERSION=$(date -u -d '+8 hours' +%Y.%-m.%-d.%-H%M)
-#   git tag "v$VERSION" && git push origin "v$VERSION"
-
+# 镜像与二进制放在同一个 workflow：GITHUB_TOKEN 推送的 tag 不会触发其他 workflow，
+# 拆成两个文件会留下「有 tag、没镜像」的静默半成品。
+#
+# 逃生阀：commit message 含 skip 标记时 mode=skip。resolve job 不能整个 skipped，
+# 否则会级联跳过测试；这里由 resolve 输出 mode —— 测试照跑，镜像与发布跳过。
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    tags: ["v[0-9]*.[0-9]*.[0-9]*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "要补发的 tag（必须已存在，形如 v0.0.1）"
+        required: true
 
 permissions:
-  contents: write
+  contents: write   # 打 tag / 建 Release
+  packages: write   # 推 ghcr
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
 
 jobs:
-  release:
-    name: build binaries
+  # ── 1. 解析本次要发的版本 ────────────────────────────────────────────
+  resolve:
     runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.ver.outputs.mode }}
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+      prev: ${{ steps.ver.outputs.prev }}
+      commit: ${{ steps.ver.outputs.commit }}
+      short: ${{ steps.ver.outputs.short }}
+      changelog: ${{ steps.ver.outputs.changelog }}
     steps:
+      # 补发必须检出「那一个 tag」：checkout 默认拉默认分支，会把旧版本用主干代码构建。
+      # 分支 push 必须用 github.sha：github.ref 是移动指针，等镜像构建完可能已指向新提交。
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
-          cache: true
-
-      - name: Test before release
-        run: go test ./... -count=1
+          ref: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref || github.sha) }}
+          fetch-depth: 0
 
       - name: Resolve version
         id: ver
-        run: |
-          # 标签形如 v2026.10.19.1430 → 二进制内嵌 2026.10.19.1430（不带 v）
-          # 手动 dispatch（没有标签）时回落到 上海时间 的当前时刻
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            version="${GITHUB_REF_NAME#v}"
-          else
-            version=$(TZ=Asia/Shanghai date +%Y.%m.%d.%H%M)
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "resolved version: $version"
-
-      - name: Build matrix
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          set -eu
-          mkdir -p dist
-          build() {
-            goos=$1; goarch=$2; ext=$3
-            name="loomy2api_${VERSION}_${goos}_${goarch}"
-            bin="loomy2api${ext}"
-            CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch go build \
-              -trimpath -ldflags "-s -w -X main.appVersion=${VERSION}" \
-              -o "dist/${bin}" ./cmd/server
-            if [ "$goos" = "windows" ]; then
-              (cd dist && zip -q "${name}.zip" "${bin}")
+          set -euo pipefail
+
+          REF="${GITHUB_REF}"
+          ACTOR="${GITHUB_ACTOR}"
+          # 逃生阀匹配整条 commit message（含正文）；dispatch 事件没有 head_commit。
+          MSG=$(python3 -c "import json,os;e=json.load(open(os.environ['GITHUB_EVENT_PATH']));print((e.get('head_commit') or {}).get('message',''))")
+
+          MODE=auto
+          if [ "$ACTOR" = "github-actions[bot]" ]; then MODE=skip; fi
+          case "$MSG" in
+            *"[skip release]"*) MODE=skip ;;
+          esac
+
+          if [ "$MODE" != "skip" ]; then
+            if [ -n "${INPUT_TAG}" ]; then
+              MODE=tag; TAG="${INPUT_TAG}"
+            elif [ "${REF#refs/tags/}" != "${REF}" ]; then
+              MODE=tag; TAG="${REF#refs/tags/}"
+            elif [ "${REF}" = "refs/heads/main" ]; then
+              MODE=auto
             else
-              (cd dist && tar -czf "${name}.tar.gz" "${bin}")
+              MODE=skip
             fi
-            rm "dist/${bin}"
-          }
-          build linux   amd64 ""
-          build linux   arm64 ""
-          build windows amd64 ".exe"
-          build darwin  amd64 ""
-          build darwin  arm64 ""
+          fi
+
+          PREV=""
+          if [ "$MODE" != "skip" ]; then
+            # --sort=-v:refname 才是版本序（字典序会把 v1.9.0 判新于 v1.10.0）；
+            # glob 顺带排除 latest 这类滚动指针。
+            PREV=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 || true)
+          fi
+
+          if [ "$MODE" = "auto" ]; then
+            BASE="${PREV:-v0.0.0}"
+            CORE="${BASE#v}"
+            CORE="${CORE%%[-+]*}"          # v1.2.3-rc.1 的后缀会打断算术
+            IFS=. read -r MA MI PA <<< "$CORE"
+            PA=$(printf '%s' "${PA:-0}" | tr -cd '0-9')
+            TAG="v${MA}.${MI}.$((10#${PA:-0} + 1))"
+            COMMIT="${GITHUB_SHA}"
+            if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+              echo "::error::tag ${TAG} 已存在（并发发版或人工打过同版本），本次中止"
+              exit 1
+            fi
+          elif [ "$MODE" = "tag" ]; then
+            COMMIT=$(git rev-parse "${TAG}^{commit}")
+            HEAD_SHA=$(git rev-parse HEAD)
+            if [ "$COMMIT" != "$HEAD_SHA" ]; then
+              echo "::error::tag ${TAG} 指向 ${COMMIT}，但检出的是 ${HEAD_SHA}"
+              exit 1
+            fi
+          else
+            TAG=""; COMMIT=""
+          fi
+
+          VERSION="${TAG#v}"
+          SHORT="${GITHUB_SHA:0:7}"
+
+          # changelog 右端点：auto 用 HEAD（tag 还没打），tag 模式用 tag 本身。
+          BODY=""
+          if [ "$MODE" != "skip" ]; then
+            if [ "$MODE" = "auto" ]; then
+              RANGE="${PREV:+${PREV}..}HEAD"
+              LIMIT="--max-count=50"
+            else
+              PREV2=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "${TAG}^" 2>/dev/null || true)
+              if [ -n "$PREV2" ]; then RANGE="${PREV2}..${TAG}"; PREV="$PREV2"; else RANGE="${TAG}"; PREV=""; fi
+              LIMIT="--max-count=50"
+            fi
+            BODY=$(git log "$RANGE" --pretty='- %s (%h)' --no-merges $LIMIT || true)
+            [ -n "$BODY" ] || BODY="- 首次发布"
+          fi
+
+          echo "mode=${MODE}"       >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"         >> "$GITHUB_OUTPUT"
+          echo "prev=${PREV}"       >> "$GITHUB_OUTPUT"
+          echo "commit=${COMMIT}"   >> "$GITHUB_OUTPUT"
+          echo "short=${SHORT}"     >> "$GITHUB_OUTPUT"
+          # 多行必须 heredoc，单行 echo 会把正文截成第一行
+          {
+            echo 'changelog<<CHANGELOG_EOF'
+            echo "$BODY"
+            echo 'CHANGELOG_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          echo "mode=${MODE} tag=${TAG} version=${VERSION} prev=${PREV:-<none>}"
+
+  # ── 2. 测试（逃生阀下也照跑）──────────────────────────────────────────
+  test:
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.commit || github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "未格式化："; echo "$out"; exit 1; fi
+      - run: go vet ./...
+      - run: go test ./... -count=1
+
+  # ── 3. 容器镜像：先本地冒烟，过了才推 ──────────────────────────────────
+  image:
+    needs: [resolve, test]
+    if: needs.resolve.outputs.mode != 'skip'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          fetch-depth: 0
+
+      - name: Build smoke image
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: docker build --build-arg VERSION="${VERSION}" -t loomy2api:smoke .
+
+      - name: Smoke test image
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker run -d --name loomy2api-smoke -p 17890:17890 loomy2api:smoke
+          trap 'docker logs loomy2api-smoke || true; docker rm -f loomy2api-smoke || true' EXIT
+
+          ok=0
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /tmp/h.json -w '%{http_code}' http://127.0.0.1:17890/healthz || true)
+            if [ "$code" = "200" ] || [ "$code" = "503" ]; then ok=1; break; fi
+            sleep 1
+          done
+          if [ "$ok" != "1" ]; then echo "::error::/healthz 30s 内未就绪"; exit 1; fi
+          cat /tmp/h.json
+          # 无账号时按设计返回 503；判据是身份字段，不是状态码
+          grep -q '"service":"loomy2api"' /tmp/h.json || { echo "::error::healthz 缺少 service 标识"; exit 1; }
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image tags
+        id: img
+        env:
+          MODE: ${{ needs.resolve.outputs.mode }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          SHORT: ${{ needs.resolve.outputs.short }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/$(printf '%s' "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          TAGS="${IMAGE}:${VERSION},${IMAGE}:sha-${SHORT}"
+          # 补发旧版本不能把 latest 拽回去；只有 main 自增才移动 latest
+          if [ "$MODE" = "auto" ]; then TAGS="${TAGS},${IMAGE}:latest"; fi
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS}"   >> "$GITHUB_OUTPUT"
+          echo "${IMAGE} -> ${TAGS}"
+
+      - name: Build and push (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.img.outputs.tags }}
+          build-args: |
+            VERSION=${{ needs.resolve.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image summary
+        run: |
+          {
+            echo "### 镜像"
+            echo '```'
+            echo "${{ steps.img.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── 4. 二进制 + tag + Release ─────────────────────────────────────────
+  release:
+    needs: [resolve, test, image]
+    if: needs.resolve.outputs.mode != 'skip'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build binaries
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            GOOS=${target%%/*}; GOARCH=${target##*/}; EXT=''
+            [ "$GOOS" = "windows" ] && EXT='.exe'
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build \
+              -trimpath -ldflags "-s -w -X main.appVersion=${VERSION}" \
+              -o "dist/loomy2api${EXT}" ./cmd/server
+            name="loomy2api_${VERSION}_${GOOS}_${GOARCH}"
+            if [ "$GOOS" = "windows" ]; then
+              (cd dist && zip -q "${name}.zip" "loomy2api.exe")
+            else
+              (cd dist && tar -czf "${name}.tar.gz" loomy2api)
+            fi
+            rm -f dist/loomy2api dist/loomy2api.exe
+          done
+          [ -n "$(ls -A dist)" ] || { echo "::error::dist/ 为空"; exit 1; }
+          (cd dist && sha256sum * > SHA256SUMS.txt)
           ls -lh dist
 
-      - name: Checksums
+      - name: Create tag (auto only)
+        if: needs.resolve.outputs.mode == 'auto'
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
         run: |
-          cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::tag ${TAG} 已存在"; exit 1
+          fi
+          git tag -a "$TAG" "$COMMIT" -m "Release $TAG"
+          git push origin "$TAG"
 
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: ${{ steps.ver.outputs.version }}
-          tag_name: ${{ github.ref_name }}
-          files: dist/*
-          generate_release_notes: true
-          body: |
-            构建时间（上海）：${{ steps.ver.outputs.version }}
+      - name: Create release (idempotent)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          BODY: ${{ needs.resolve.outputs.changelog }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG 已存在，跳过创建（补跑幂等）"
+            exit 0
+          fi
+          printf '%s\n' "$BODY" > /tmp/notes.md
+          cat >> /tmp/notes.md <<EOF
 
-            | 文件 | 说明 |
-            |---|---|
-            | `*_linux_amd64.tar.gz` | Linux x64 |
-            | `*_linux_arm64.tar.gz` | Linux ARM64 |
-            | `*_windows_amd64.zip` | Windows x64 |
-            | `*_darwin_*.tar.gz` | macOS（Intel / Apple Silicon） |
-            | `SHA256SUMS.txt` | 校验和 |
+          ### 产物
 
-            首次运行会自动生成 `config.json` 并在日志里打印随机 `api_key`。
-            用法见 [README](https://github.com/${{ github.repository }}#快速开始)。
+          | 文件 | 平台 |
+          |---|---|
+          | \`*_linux_amd64.tar.gz\` | Linux x64 |
+          | \`*_linux_arm64.tar.gz\` | Linux ARM64 |
+          | \`*_darwin_amd64.tar.gz\` | macOS Intel |
+          | \`*_darwin_arm64.tar.gz\` | macOS Apple Silicon |
+          | \`*_windows_amd64.zip\` | Windows x64 |
+
+          容器镜像：\`${REGISTRY}/$(printf '%s' "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]'):${VERSION}\`
+
+          首次运行会自动生成 \`config.json\` 并在日志里打印随机 \`api_key\`。
+          EOF
+          gh release create "$TAG" --title "Release $VERSION" --notes-file /tmp/notes.md dist/*
