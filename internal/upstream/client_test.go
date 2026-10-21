@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yuanjie-ai/loomy2api/internal/config"
+	"github.com/rsfree/loomy2api/internal/config"
 )
 
 // TestHeadersRequired 三个必需头齐全且 Authorization 双写。

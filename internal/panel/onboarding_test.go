@@ -8,8 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/yuanjie-ai/loomy2api/internal/pool"
-	"github.com/yuanjie-ai/loomy2api/internal/upstream"
+	"github.com/rsfree/loomy2api/internal/pool"
+	"github.com/rsfree/loomy2api/internal/upstream"
 )
 
 // TestOnboardingMatrix 任务中心矩阵：顺序固定、点数按本地表、不可查询的号不发请求。

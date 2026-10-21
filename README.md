@@ -126,7 +126,7 @@ docker compose logs -f    # 看首启生成的 api_key
 ```bash
 docker run -d --name loomy2api -p 17890:17890 \
   -v "$PWD/data:/data" \
-  ghcr.io/yuanjie-ai/loomy2api:latest
+  ghcr.io/rsfree/loomy2api:latest
 ```
 
 ### 客户端接入

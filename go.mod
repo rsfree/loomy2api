@@ -1,4 +1,4 @@
-module github.com/yuanjie-ai/loomy2api
+module github.com/rsfree/loomy2api
 
 go 1.23
 

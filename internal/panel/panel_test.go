@@ -12,12 +12,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yuanjie-ai/loomy2api/internal/account"
-	"github.com/yuanjie-ai/loomy2api/internal/config"
-	"github.com/yuanjie-ai/loomy2api/internal/pool"
-	"github.com/yuanjie-ai/loomy2api/internal/server"
-	"github.com/yuanjie-ai/loomy2api/internal/upstream"
-	"github.com/yuanjie-ai/loomy2api/internal/usage"
+	"github.com/rsfree/loomy2api/internal/account"
+	"github.com/rsfree/loomy2api/internal/config"
+	"github.com/rsfree/loomy2api/internal/pool"
+	"github.com/rsfree/loomy2api/internal/server"
+	"github.com/rsfree/loomy2api/internal/upstream"
+	"github.com/rsfree/loomy2api/internal/usage"
 )
 
 func newTestPanel(t *testing.T) (*Panel, *pool.Pool) {

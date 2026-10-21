@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/yuanjie-ai/loomy2api/internal/account"
+	"github.com/rsfree/loomy2api/internal/account"
 )
 
 // ResponsesToChat 把 Responses 请求翻成 Chat Completions 请求。

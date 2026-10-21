@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/yuanjie-ai/loomy2api/internal/account"
+	"github.com/rsfree/loomy2api/internal/account"
 )
 
 // writeJSON 写出 JSON（不设状态码，调用方负责）。

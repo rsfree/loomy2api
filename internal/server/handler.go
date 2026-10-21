@@ -16,12 +16,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/yuanjie-ai/loomy2api/internal/bridge"
-	"github.com/yuanjie-ai/loomy2api/internal/config"
-	"github.com/yuanjie-ai/loomy2api/internal/httpauth"
-	"github.com/yuanjie-ai/loomy2api/internal/pool"
-	"github.com/yuanjie-ai/loomy2api/internal/upstream"
-	"github.com/yuanjie-ai/loomy2api/internal/usage"
+	"github.com/rsfree/loomy2api/internal/bridge"
+	"github.com/rsfree/loomy2api/internal/config"
+	"github.com/rsfree/loomy2api/internal/httpauth"
+	"github.com/rsfree/loomy2api/internal/pool"
+	"github.com/rsfree/loomy2api/internal/upstream"
+	"github.com/rsfree/loomy2api/internal/usage"
 )
 
 // Handler 网关主 handler。

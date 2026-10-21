@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yuanjie-ai/loomy2api/internal/config"
-	"github.com/yuanjie-ai/loomy2api/internal/pool"
-	"github.com/yuanjie-ai/loomy2api/internal/upstream"
-	"github.com/yuanjie-ai/loomy2api/internal/usage"
+	"github.com/rsfree/loomy2api/internal/config"
+	"github.com/rsfree/loomy2api/internal/pool"
+	"github.com/rsfree/loomy2api/internal/upstream"
+	"github.com/rsfree/loomy2api/internal/usage"
 )
 
 // fakeUpstream 一个可编程的上游：按顺序返回预设响应。

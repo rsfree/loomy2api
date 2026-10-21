@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yuanjie-ai/loomy2api/internal/usage"
+	"github.com/rsfree/loomy2api/internal/usage"
 )
 
 func TestErrorSummaryGroups(t *testing.T) {

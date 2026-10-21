@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/yuanjie-ai/loomy2api/internal/account"
+	"github.com/rsfree/loomy2api/internal/account"
 )
 
 // BlocksToText 把 Anthropic 的 content（字符串或块数组）压成纯文本。

@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yuanjie-ai/loomy2api/internal/config"
-	"github.com/yuanjie-ai/loomy2api/internal/usage"
+	"github.com/rsfree/loomy2api/internal/config"
+	"github.com/rsfree/loomy2api/internal/usage"
 )
 
 // fakeUpstream 起一个复刻 Loomy 抓包形态的假上游：records / first-login / models。

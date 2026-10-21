@@ -17,8 +17,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yuanjie-ai/loomy2api/internal/pool"
-	"github.com/yuanjie-ai/loomy2api/internal/upstream"
+	"github.com/rsfree/loomy2api/internal/pool"
+	"github.com/rsfree/loomy2api/internal/upstream"
 )
 
 // onboardingTaskMeta 任务的展示元数据。Short 是矩阵里的短标签：

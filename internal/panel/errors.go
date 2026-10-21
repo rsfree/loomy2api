@@ -11,7 +11,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/yuanjie-ai/loomy2api/internal/usage"
+	"github.com/rsfree/loomy2api/internal/usage"
 )
 
 // ErrStat 一行「账号 × 模型 × 状态」聚合。

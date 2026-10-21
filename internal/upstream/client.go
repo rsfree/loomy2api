@@ -20,8 +20,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yuanjie-ai/loomy2api/internal/account"
-	"github.com/yuanjie-ai/loomy2api/internal/config"
+	"github.com/rsfree/loomy2api/internal/account"
+	"github.com/rsfree/loomy2api/internal/config"
 )
 
 // 真实 /models 响应把「倍率」和「限时免费」都写在展示名里，没有结构化字段：

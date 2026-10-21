@@ -18,9 +18,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yuanjie-ai/loomy2api/internal/account"
-	"github.com/yuanjie-ai/loomy2api/internal/pool"
-	"github.com/yuanjie-ai/loomy2api/internal/upstream"
+	"github.com/rsfree/loomy2api/internal/account"
+	"github.com/rsfree/loomy2api/internal/pool"
+	"github.com/rsfree/loomy2api/internal/upstream"
 )
 
 // ---------------------------------------------------------------- 积分构成
