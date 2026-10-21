@@ -282,10 +282,11 @@ func (h *Handler) listModels(w http.ResponseWriter, r *http.Request) {
 			item["multiplier"] = 0
 		}
 		if m.IsImage() {
-			// 图像模型只能走 images/generations：给客户端一个可直接照用的端点提示，
-			// 免得只读 /v1/models 的客户端把它当对话模型选中（上游会回 404）。
+			// 图像模型的规范端点是 generations；edits 是 multipart 前门，
+			// chat / responses 也能用（会折成生图请求，见 imagefront.go）。
 			item["endpoint"] = "/v1/images/generations"
-			item["supports_chat"] = false
+			item["edits_endpoint"] = "/v1/images/edits"
+			item["supports_chat"] = true
 		}
 		if m.IsDefault {
 			item["is_default_model"] = true
@@ -330,9 +331,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	model := h.resolveModel(r.Context(), req)
 	if h.imageOnlyModel(r.Context(), model) {
-		// 图像模型走对话端点上游必回 404，且 404 会按 FaultNotFound 短冷却账号：
-		// 一个选错模型的请求不该冻掉唯一可用账号，所以在这里直接 400 拦住。
-		rejectImageModel(w, model)
+		// 图像模型走对话端点 = image-adapter 的 chat 前门：把 messages 折成
+		// prompt + image，内部调 images/generations，再把结果封成 chat.completion。
+		h.imageChat(w, r, req, model)
 		return
 	}
 	if h.rejectUnknownModel(w, model) {
@@ -687,7 +688,8 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	model := h.resolveModel(r.Context(), chatReq)
 	chatReq["model"] = model
 	if h.imageOnlyModel(r.Context(), model) {
-		rejectImageModel(w, model)
+		// 图像模型的 responses 前门：input 折成 prompt + image，响应封成 output[]。
+		h.imageResponses(w, r, req, model)
 		return
 	}
 	if h.rejectUnknownModel(w, model) {

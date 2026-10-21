@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // maxImagePart 单张参考图上限。整包还有 withAuth 的 256MB 兜底，
@@ -221,4 +222,283 @@ func partDataURI(data []byte) (string, bool) {
 		return "", false
 	}
 	return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data), true
+}
+
+// ---------------------------------------------------------------- 对话前门
+
+// captureWriter 把 passthrough 的输出收进内存，供 chat / responses 前门二次封装。
+type captureWriter struct {
+	h    http.Header
+	code int
+	buf  bytes.Buffer
+}
+
+func (c *captureWriter) Header() http.Header {
+	if c.h == nil {
+		c.h = http.Header{}
+	}
+	return c.h
+}
+func (c *captureWriter) WriteHeader(code int) { c.code = code }
+func (c *captureWriter) Write(p []byte) (int, error) {
+	if c.code == 0 {
+		c.code = http.StatusOK
+	}
+	return c.buf.Write(p)
+}
+
+// imageChat 图像模型的 /v1/chat/completions 前门。
+func (h *Handler) imageChat(w http.ResponseWriter, r *http.Request, req map[string]any, model string) {
+	prompt, images := chatPromptImages(req)
+	payload := imagePayload(req, model, prompt, images)
+	code, out := h.generateImageCaptured(r, payload)
+	if code != http.StatusOK {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(code)
+		_, _ = w.Write(out)
+		return
+	}
+	urls, pts := imageURLs(out)
+	text := markdownImages(urls)
+	created := time.Now().Unix()
+	id := fmt.Sprintf("imgchat_%d", time.Now().UnixNano())
+
+	if truthy(req["stream"]) {
+		writeImageChatStream(w, id, model, created, text, pts)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"id":      id,
+		"object":  "chat.completion",
+		"created": created,
+		"model":   model,
+		"choices": []any{map[string]any{
+			"index":         0,
+			"message":       map[string]any{"role": "assistant", "content": text},
+			"finish_reason": "stop",
+		}},
+		"usage": imageUsage(pts),
+	})
+}
+
+// imageResponses 图像模型的 /v1/responses 前门。
+func (h *Handler) imageResponses(w http.ResponseWriter, r *http.Request, req map[string]any, model string) {
+	prompt, images := responsesPromptImages(req)
+	payload := imagePayload(req, model, prompt, images)
+	code, out := h.generateImageCaptured(r, payload)
+	if code != http.StatusOK {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(code)
+		_, _ = w.Write(out)
+		return
+	}
+	if truthy(req["stream"]) {
+		writeErr(w, http.StatusBadRequest, "生图 responses 前门暂不支持 stream=true；请去掉 stream 或改用 /v1/chat/completions", "invalid_request_error")
+		return
+	}
+	urls, pts := imageURLs(out)
+	writeJSON(w, map[string]any{
+		"id":         fmt.Sprintf("resp_%d", time.Now().UnixNano()),
+		"object":     "response",
+		"created_at": time.Now().Unix(),
+		"model":      model,
+		"status":     "completed",
+		"output": []any{map[string]any{
+			"id":     fmt.Sprintf("msg_%d", time.Now().UnixNano()),
+			"type":   "message",
+			"role":   "assistant",
+			"status": "completed",
+			"content": []any{map[string]any{
+				"type": "output_text", "text": markdownImages(urls), "annotations": []any{},
+			}},
+		}},
+		"usage": imageUsage(pts),
+	})
+}
+
+// generateImageCaptured 复用 generations 透传管道（选号/冷却/记账全一致），
+// 只是把响应收进内存而不是直接写给客户端。
+func (h *Handler) generateImageCaptured(r *http.Request, payload map[string]any) (int, []byte) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return http.StatusBadRequest, []byte(`{"error":{"message":"序列化失败"}}`)
+	}
+	r2 := r.Clone(r.Context())
+	r2.Body = io.NopCloser(bytes.NewReader(body))
+	r2.ContentLength = int64(len(body))
+	r2.Header = r.Header.Clone()
+	r2.Header.Set("Content-Type", "application/json")
+	cw := &captureWriter{}
+	h.passthrough("images/generations", "image")(cw, r2)
+	if cw.code == 0 {
+		cw.code = http.StatusOK
+	}
+	return cw.code, cw.buf.Bytes()
+}
+
+// chatPromptImages 把 chat messages 折成 prompt + 参考图列表。
+func chatPromptImages(req map[string]any) (string, []string) {
+	var texts []string
+	var images []string
+	msgs, _ := req["messages"].([]any)
+	for _, raw := range msgs {
+		m, _ := raw.(map[string]any)
+		switch c := m["content"].(type) {
+		case string:
+			if strings.TrimSpace(c) != "" {
+				texts = append(texts, c)
+			}
+		case []any:
+			for _, p := range c {
+				part, _ := p.(map[string]any)
+				switch str(part["type"]) {
+				case "text", "input_text":
+					if s := str(part["text"]); strings.TrimSpace(s) != "" {
+						texts = append(texts, s)
+					}
+				case "image_url", "input_image":
+					if u := imageURLOf(part); u != "" {
+						images = append(images, u)
+					}
+				}
+			}
+		}
+	}
+	return joinPrompt(texts), images
+}
+
+// responsesPromptImages 把 responses input 折成 prompt + 参考图列表。
+func responsesPromptImages(req map[string]any) (string, []string) {
+	var texts []string
+	var images []string
+	switch in := req["input"].(type) {
+	case string:
+		texts = append(texts, in)
+	case []any:
+		for _, raw := range in {
+			item, _ := raw.(map[string]any)
+			if s := str(item["text"]); strings.TrimSpace(s) != "" {
+				texts = append(texts, s)
+			}
+			if u := imageURLOf(item); u != "" {
+				images = append(images, u)
+			}
+			content, _ := item["content"].([]any)
+			for _, c := range content {
+				part, _ := c.(map[string]any)
+				if s := str(part["text"]); strings.TrimSpace(s) != "" {
+					texts = append(texts, s)
+				}
+				if u := imageURLOf(part); u != "" {
+					images = append(images, u)
+				}
+			}
+		}
+	}
+	return joinPrompt(texts), images
+}
+
+func imageURLOf(part map[string]any) string {
+	switch v := part["image_url"].(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case map[string]any:
+		return strings.TrimSpace(str(v["url"]))
+	}
+	return ""
+}
+
+func joinPrompt(parts []string) string {
+	s := strings.TrimSpace(strings.Join(parts, "\n"))
+	if s == "" {
+		return "根据参考图生成图片"
+	}
+	return s
+}
+
+func imagePayload(req map[string]any, model, prompt string, images []string) map[string]any {
+	p := map[string]any{"model": model, "prompt": prompt}
+	switch len(images) {
+	case 0:
+	case 1:
+		p["image"] = images[0]
+	default:
+		arr := make([]any, len(images))
+		for i, s := range images {
+			arr[i] = s
+		}
+		p["image"] = arr
+	}
+	if n, ok := req["n"]; ok {
+		p["n"] = n
+	}
+	if s := str(req["size"]); s != "" {
+		p["size"] = s
+	}
+	return p
+}
+
+func imageURLs(out []byte) ([]string, int64) {
+	var obj map[string]any
+	_ = json.Unmarshal(out, &obj)
+	var urls []string
+	if data, ok := obj["data"].([]any); ok {
+		for _, it := range data {
+			m, _ := it.(map[string]any)
+			if u := str(m["url"]); u != "" {
+				urls = append(urls, u)
+			}
+		}
+	}
+	pts := int64(0)
+	switch v := obj["points_consumed"].(type) {
+	case float64:
+		pts = int64(v)
+	case int64:
+		pts = v
+	}
+	return urls, pts
+}
+
+func markdownImages(urls []string) string {
+	if len(urls) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(urls))
+	for _, u := range urls {
+		parts = append(parts, "![image]("+u+")\n"+u)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func imageUsage(pts int64) map[string]any {
+	return map[string]any{
+		"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+		"points_consumed": pts,
+	}
+}
+
+func writeImageChatStream(w http.ResponseWriter, id, model string, created int64, text string, pts int64) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	fl, _ := w.(http.Flusher)
+	chunk := func(delta map[string]any, finish any) {
+		obj := map[string]any{
+			"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+			"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}},
+		}
+		b, _ := json.Marshal(obj)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+		if fl != nil {
+			fl.Flush()
+		}
+	}
+	chunk(map[string]any{"role": "assistant"}, nil)
+	chunk(map[string]any{"content": text}, nil)
+	chunk(map[string]any{}, "stop")
+	_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	if fl != nil {
+		fl.Flush()
+	}
 }
