@@ -1,0 +1,32 @@
+services:
+  loomy2api:
+    build:
+      context: .
+      args:
+        VERSION: dev
+    image: loomy2api:latest
+    container_name: loomy2api
+    restart: unless-stopped
+    ports:
+      # 默认只绑本机；要对外暴露时改成 "17890:17890"，并务必先设置 api_keys
+      - "127.0.0.1:17890:17890"
+    environment:
+      TZ: Asia/Shanghai
+      # 网关密钥，逗号分隔（与面板登录同一把）。也可写进 /data/config.json 的 api_keys
+      # LOOMY_API_KEYS: "sk-loomy-xxx"
+      # 监听地址（容器内保持 17890，端口映射在外面改）
+      # LOOMY_LISTEN: ":17890"
+    volumes:
+      # config.json / auths / data（状态与台账）全部落在这个卷里
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:17890/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

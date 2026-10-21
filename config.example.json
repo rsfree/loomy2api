@@ -1,0 +1,114 @@
+{
+  "_comment": "复制为 config.json 后修改。所有键都可用环境变量覆盖（LOOMY_ 前缀）。标注 [重启] 的字段改动后需重启进程。",
+  "_docs": "完整说明见 README.md；协议细节见 docs/PROTOCOL.md",
+
+  "listen": ":17890",
+  "_listen": "[重启] 监听地址",
+
+  "api_keys": [],
+  "_api_keys": "网关密钥列表，空 = 不鉴权（仅限本机/内网）。可用 LOOMY_API_KEYS 逗号分隔覆盖",
+
+
+  "auth_dir": "./auths",
+  "_auth_dir": "[重启] 账号凭证目录（每个账号一个 json，0600）",
+
+  "state_file": "./data/state.json",
+  "_state_file": "[重启] 账号池状态持久化文件",
+
+  "log_dir": "./logs",
+  "_log_dir": "[重启] 日志目录",
+
+  "upstream": "https://loomyad.xunfei.cn/api/v1",
+  "_upstream": "[重启] 上游模型网关（OpenAI 兼容）",
+
+  "account_base": "https://account.xfinfr.com",
+  "_account_base": "[重启] 讯飞账号服务",
+
+  "account_appid": "GM3LOOMY",
+  "access_key_id": "",
+  "_access_key_id": "账号服务签名用 access key id；空 = 用客户端内置常量",
+  "access_key_secret": "",
+  "_access_key_secret": "账号服务签名密钥；空 = 用客户端内置常量",
+
+  "loomy_version": "0.9.38",
+  "_loomy_version": "发送给上游的 loomy-version 头（上游只检查存在性）",
+
+  "proxy": "",
+  "_proxy": "全局出口代理，如 http://127.0.0.1:7890；账号级 proxy 可覆盖",
+
+  "default_model": "imodel/deepseek-v4-flash-0731",
+  "strip_model_prefix": true,
+  "_strip_model_prefix": "模型名缺 provider 前缀时自动补 imodel/",
+
+  "timeout_seconds": 3600,
+  "_timeout_seconds": "短 RPC 超时；聊天请求不受此限制（流式可能跑很久）",
+
+  "max_retries": 2,
+  "_max_retries": "换号重试次数（额度耗尽/限流/登录态失效时换下一个账号）",
+
+  "keepalive_min_tokens": 1500,
+  "_keepalive_min_tokens": "非流式且 max_tokens ≥ 此值时，内部转流式取数再聚合（绕开上游 ~60s 的 504）",
+
+  "cooldown_seconds": 300,
+  "_cooldown_seconds": "兜底冷却（未分类错误）",
+
+  "soft_rate_base_seconds": 600,
+  "_soft_rate_base_seconds": "429 软冷却基数，逐次加倍",
+
+  "soft_rate_max_seconds": 7200,
+  "_soft_rate_max_seconds": "软冷却封顶（2h）",
+
+  "not_found_cooldown_seconds": 60,
+  "_not_found_cooldown_seconds": "404 短冷却",
+
+  "breaker_threshold": 5,
+  "_breaker_threshold": "连续 N 次账号自身失败 → 熔断",
+
+  "breaker_cooldown_seconds": 60,
+  "breaker_cooldown_max_seconds": 1800,
+  "_breaker": "熔断基数与封顶（逐次加倍）",
+
+  "strategy": "weighted",
+  "_strategy": "weighted（三因子加权+Top-N抽签）/ round_robin / balance / lru",
+
+  "pick_top_n": 5,
+  "_pick_top_n": "加权选号的候选短名单大小",
+
+  "max_inflight_per_account": 0,
+  "_max_inflight_per_account": "单账号在途请求上限；0 = 不限",
+
+  "balance_floor": 0,
+  "_balance_floor": "积分保底：可用积分 ≤ 此值停止接单；0 = 关闭",
+
+  "prefer_daily_quota": true,
+  "_prefer_daily_quota": "选号优先花「今日赠送额度」（按自然日清零），再动永久积分。上游不会因赠送额度耗尽报错（静默改扣永久积分、照常 200），只能靠排序实现",
+
+  "strict_model_check": true,
+  "_strict_model_check": "请求的模型不在上游目录里时直接 404，不打上游。必须默认开：Loomy 对认不出的模型名不报错，而是静默用默认模型执行并回 200（实测 no-such-model-xyz → 响应 model 变成 DeepSeek-V4.1-Flash，按默认模型扣分）",
+
+  "dead_model_ttl_days": 30,
+  "_dead_model_ttl_days": "上游回 404「该模型暂未开放」时把该模型记多久（天）：期间 /v1/models 不列它、请求直接 404；0 = 用内置默认 30 天",
+
+  "sticky_ttl_seconds": 1800,
+  "_sticky_ttl_seconds": "会话粘性 TTL；0 = 关闭",
+
+  "sticky_max_entries": 2000,
+  "_sticky_max_entries": "粘性表容量上限",
+
+  "session_renew_before_days": 3,
+  "_session_renew_before_days": "登录态剩余天数低于此值时在日志里告警（上游无 refresh token，只能重登）",
+
+  "quota_refresh_minutes": 30,
+  "_quota_refresh_minutes": "后台全量额度刷新间隔（分钟）",
+
+  "usage_max_entries": 20000,
+  "_usage_max_entries": "请求台账内存保留条数（同时逐条追加到 state 同目录 usage.jsonl）",
+
+  "log_requests": true,
+  "log_client_info": true,
+  "_log": "是否打印每请求一行日志 / 是否记录调用来源 IP 与 UA",
+
+  "identity_mode": "per_account",
+  "sessions_from_client": true,
+  "_identity_mode": "per_account = 每账号一套设备身份占位；client = 完全镜像客户端"
+}

@@ -1,0 +1,96 @@
+name: docker-ghcr
+
+# 多架构镜像（amd64 / arm64）构建与发布：
+#   - push main      → 推 latest / main / sha-xxxxxxx
+#   - push v* tag    → 推版本号（去掉 v 前缀）+ latest
+#   - pull_request   → 只构建验证，不推送
+#
+# 与 workbuddy2api 的发布口径一致：镜像 tag 不带 v 前缀，latest 只在 main / tag 上更新。
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "go.mod"
+      - "cmd/**"
+      - "internal/**"
+      - "config.example.json"
+      - ".github/workflows/docker-ghcr.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU（arm64 交叉模拟）
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image tags
+        id: tags
+        run: |
+          set -eu
+          image="${REGISTRY}/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          version="dev"
+          tags=""
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            tags="${image}:${version},${image}:latest"
+          elif [ "${GITHUB_REF_NAME}" = "main" ]; then
+            version="${GITHUB_SHA::7}"
+            tags="${image}:latest,${image}:main,${image}:sha-${version}"
+          else
+            tags="${image}:pr-${{ github.event.pull_request.number }}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            VERSION=${{ steps.tags.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### 镜像"
+            echo ""
+            echo '```'
+            echo "${{ steps.tags.outputs.image }}"
+            echo "tags: ${{ steps.tags.outputs.tags }}"
+            echo "version: ${{ steps.tags.outputs.version }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

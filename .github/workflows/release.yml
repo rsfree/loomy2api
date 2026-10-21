@@ -1,0 +1,100 @@
+name: Release
+
+# 版本标签用上海时间，形如 v2026.10.19.1430（时不补零、分两位、不带秒）。
+# 本机（Windows / git-bash）没有 tzdata，`TZ=Asia/Shanghai date` 会静默回落 UTC
+# 导致标签早 8 小时，所以打标签用显式加 8 小时的写法：
+#
+#   VERSION=$(TZ=Asia/Shanghai date +%Y.%-m.%-d.%-H%M)
+#   [ "$(TZ=UTC date +%H)" = "$(TZ=Asia/Shanghai date +%H)" ] \
+#     && VERSION=$(date -u -d '+8 hours' +%Y.%-m.%-d.%-H%M)
+#   git tag "v$VERSION" && git push origin "v$VERSION"
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: Test before release
+        run: go test ./... -count=1
+
+      - name: Resolve version
+        id: ver
+        run: |
+          # 标签形如 v2026.10.19.1430 → 二进制内嵌 2026.10.19.1430（不带 v）
+          # 手动 dispatch（没有标签）时回落到 上海时间 的当前时刻
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version=$(TZ=Asia/Shanghai date +%Y.%m.%d.%H%M)
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "resolved version: $version"
+
+      - name: Build matrix
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -eu
+          mkdir -p dist
+          build() {
+            goos=$1; goarch=$2; ext=$3
+            name="loomy2api_${VERSION}_${goos}_${goarch}"
+            bin="loomy2api${ext}"
+            CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch go build \
+              -trimpath -ldflags "-s -w -X main.appVersion=${VERSION}" \
+              -o "dist/${bin}" ./cmd/server
+            if [ "$goos" = "windows" ]; then
+              (cd dist && zip -q "${name}.zip" "${bin}")
+            else
+              (cd dist && tar -czf "${name}.tar.gz" "${bin}")
+            fi
+            rm "dist/${bin}"
+          }
+          build linux   amd64 ""
+          build linux   arm64 ""
+          build windows amd64 ".exe"
+          build darwin  amd64 ""
+          build darwin  arm64 ""
+          ls -lh dist
+
+      - name: Checksums
+        run: |
+          cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.ver.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            构建时间（上海）：${{ steps.ver.outputs.version }}
+
+            | 文件 | 说明 |
+            |---|---|
+            | `*_linux_amd64.tar.gz` | Linux x64 |
+            | `*_linux_arm64.tar.gz` | Linux ARM64 |
+            | `*_windows_amd64.zip` | Windows x64 |
+            | `*_darwin_*.tar.gz` | macOS（Intel / Apple Silicon） |
+            | `SHA256SUMS.txt` | 校验和 |
+
+            首次运行会自动生成 `config.json` 并在日志里打印随机 `api_key`。
+            用法见 [README](https://github.com/${{ github.repository }}#快速开始)。

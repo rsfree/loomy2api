@@ -1,0 +1,13 @@
+# 构建上下文瘦身：凭证、状态、台账、本地二进制都不进镜像
+.git
+.gitignore
+.github
+auths/
+data/
+logs/
+config.json
+loomy2api
+loomy2api.exe
+dist/
+*.log
+.DS_Store

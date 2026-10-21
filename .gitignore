@@ -1,0 +1,31 @@
+# 构建产物
+/loomy2api
+/loomy2api.exe
+/server
+*.exe
+dist/
+bin/
+
+# 运行时数据（绝不入库：auths 里是明文凭证）
+/config.json
+/auths/
+/data/
+/logs/
+*.log
+
+# 台账与状态
+state.json
+state.json.tmp
+usage.jsonl
+usage.jsonl.tmp
+
+# 本地临时
+.env
+.DS_Store
+Thumbs.db
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*~

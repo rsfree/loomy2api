@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags-ignore: ["v*"]      # 打标签走 release 工作流
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build · vet · test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: Verify gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "以下文件未格式化，请运行 gofmt -w ."
+            echo "$out"
+            exit 1
+          fi
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./... -count=1 -v
+
+      - name: Cross-compile check
+        run: |
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -o /dev/null ./cmd/server
+          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -o /dev/null ./cmd/server
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o /dev/null ./cmd/server
+          CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o /dev/null ./cmd/server
+
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build --build-arg VERSION=ci -t loomy2api:ci .
+
+      - name: Smoke test image
+        run: |
+          # 起容器，验 /healthz 能回（无账号时应为 503，带 service 字段即可）
+          docker run -d --name smoke -p 17890:17890 loomy2api:ci -config /data/config.json || true
+          sleep 5
+          code=$(curl -s -o /tmp/h.json -w '%{http_code}' http://127.0.0.1:17890/healthz || echo 000)
+          echo "healthz status=$code body=$(cat /tmp/h.json 2>/dev/null)"
+          grep -q loomy2api /tmp/h.json
+          docker logs smoke
+          docker rm -f smoke

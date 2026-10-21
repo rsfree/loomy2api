@@ -1,0 +1,31 @@
+# 统一用 LF：gofmt 与 CI 的 gofmt 检查都按 LF 判定，
+# Windows 上检出成 CRLF 会让 `gofmt -l` 把所有文件都列出来（CI 直接失败）。
+* text=auto eol=lf
+
+# Go 源码与测试
+*.go      text eol=lf
+
+# 构建与 CI 脚本：shebang / 运行时对 CRLF 敏感
+*.sh      text eol=lf
+Dockerfile       text eol=lf
+Makefile         text eol=lf
+docker-compose.yml text eol=lf
+
+# 配置与文档
+*.json    text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.md      text eol=lf
+
+# 前端资源（go:embed 打进二进制的文本）
+*.js      text eol=lf
+*.css     text eol=lf
+*.html    text eol=lf
+
+# 二进制
+*.exe     binary
+*.png     binary
+*.jpg     binary
+*.gif     binary
+*.zip     binary
+*.gz      binary
