@@ -23,6 +23,9 @@ var appJS []byte
 //go:embed theme.js
 var themeJS []byte
 
+//go:embed favicon.svg
+var faviconSVG []byte
+
 // csp 内容安全策略（严格版，无需 unsafe-inline 脚本）：
 //   - default-src 'none'   默认全禁，逐个开口
 //   - script-src 'self'    只跑同源脚本（app.js）
@@ -68,4 +71,14 @@ func (p *Panel) themeScript(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(themeJS)
+}
+
+// favicon 内嵌 SVG 图标：没有它浏览器每次开面板都会请求 /favicon.ico 拿 404，
+// 控制台里多一条红字，排查真错误时反而碍事。
+func (p *Panel) favicon(w http.ResponseWriter, r *http.Request) {
+	setSecurityHeaders(w)
+	w.Header().Set("Content-Type", "image/svg+xml")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(faviconSVG)
 }

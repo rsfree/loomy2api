@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Loomy2API">
+  <rect width="32" height="32" rx="8" fill="#14171f"/>
+  <path d="M10 8.5v15h13" fill="none" stroke="#5b7cfa" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="23.5" cy="9.5" r="3" fill="#3ddc97"/>
+</svg>

@@ -137,6 +137,20 @@ func TestAppScriptServed(t *testing.T) {
 	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "javascript") {
 		t.Errorf("theme.js Content-Type = %q", ct)
 	}
+
+	// favicon 也要能取到：缺了它浏览器每次开面板都 404，控制台多一条红字。
+	req = httptest.NewRequest(http.MethodGet, "/panel/favicon.svg", nil)
+	w = httptest.NewRecorder()
+	pl.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("favicon.svg 状态码 %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "image/svg+xml") {
+		t.Errorf("favicon.svg Content-Type = %q", ct)
+	}
+	if !strings.Contains(w.Body.String(), "<svg") {
+		t.Error("favicon.svg 内容不是 SVG")
+	}
 }
 
 // TestPanelAuthEnforced 配了 api_key 后数据接口必须鉴权。

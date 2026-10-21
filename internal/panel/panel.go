@@ -78,6 +78,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/theme.js", p.themeScript)
+	p.mux.HandleFunc("GET /panel/favicon.svg", p.favicon)
 
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
 	p.mux.HandleFunc("POST /panel/api/accounts", p.withAuth(p.addAccount))
