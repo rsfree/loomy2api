@@ -1023,7 +1023,8 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 				return
 			}
 			lastStatus, lastBody = resp.Status, out
-			h.Pool.ReportFailure(acc, resp.Status, out, "", model)
+			// 非对话端点：404 只说明该模型不支持这个能力，不能写模型台账（见 pool 注释）。
+			h.Pool.ReportFailureNoDead(acc, resp.Status, out, "", model)
 			if pool.FatalRequest(pool.Classify(resp.Status, out)) {
 				break
 			}

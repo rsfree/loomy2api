@@ -894,6 +894,43 @@ func TestImageGenerationRecordsPoints(t *testing.T) {
 	}
 }
 
+// TestEmbeddings404DoesNotHideChatModel 非对话端点的 404 只回错，不能把 chat 模型
+// 记成「已下架」——实测 embeddings 用 chat 模型回 404 page not found，旧实现会把
+// spark-x2.6 从 /v1/models 隐藏 30 天。
+func TestEmbeddings404DoesNotHideChatModel(t *testing.T) {
+	fs := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"spark-x2.6","type":"chat"}]}`)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"error":"404 page not found"}`)
+	})
+	h, p, _ := newTestHandler(t, fs.srv.URL, nil)
+	if list := h.Models.Get(context.Background(), "sess"); len(list) != 1 {
+		t.Fatalf("目录预热失败：%d 个模型", len(list))
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings",
+		strings.NewReader(`{"model":"spark-x2.6","input":"hi"}`))
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("状态码 %d，期望 404", w.Code)
+	}
+	if got := p.DeadModels(); len(got) != 0 {
+		t.Errorf("embeddings 404 不该记模型台账：%+v", got)
+	}
+
+	// 目录仍应列出该模型
+	req = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w = httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+	if !strings.Contains(w.Body.String(), "spark-x2.6") {
+		t.Errorf("/v1/models 不应隐藏 spark-x2.6：%s", w.Body.String())
+	}
+}
+
 // TestModelsMarksImageEndpoint /v1/models 里图像模型要带 endpoint / supports_chat=false，
 // 对话模型不带——客户端才能据此决定调到哪个端点。
 func TestModelsMarksImageEndpoint(t *testing.T) {

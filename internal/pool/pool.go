@@ -400,6 +400,20 @@ func (p *Pool) ReportSuccess(a *Account, sessionKey, model string, points int64)
 
 // ReportFailure 失败一次：按错误分类决定账号处置。
 func (p *Pool) ReportFailure(a *Account, status int, body, sessionKey, model string) {
+	p.reportFailure(a, status, body, sessionKey, model, true)
+}
+
+// ReportFailureNoDead 非对话端点（embeddings / images / search）的失败。
+//
+// 同样的 404 在对话端点意味着「模型已下架」，在非对话端点却通常只是
+// 「该模型不支持这个能力」——实测 `POST /v1/embeddings` 用 chat 模型换来
+// 上游 `404 page not found`，若照对话端点处理会把 spark-x2.6 从 /v1/models
+// 隐藏 30 天。故这类请求的 404 只回错，不写模型台账。
+func (p *Pool) ReportFailureNoDead(a *Account, status int, body, sessionKey, model string) {
+	p.reportFailure(a, status, body, sessionKey, model, false)
+}
+
+func (p *Pool) reportFailure(a *Account, status int, body, sessionKey, model string, markDead bool) {
 	if a == nil {
 		return
 	}
@@ -411,7 +425,9 @@ func (p *Pool) ReportFailure(a *Account, status int, body, sessionKey, model str
 	// 故记进模型级台账（/v1/models 会隐藏它）并**完全不碰账号**——连 Failures
 	// 都不加，否则 404 会污染该账号在所有模型上的成功率权重。
 	if class == FaultNotFound {
-		p.MarkModelDead(model, FaultMessage(body))
+		if markDead {
+			p.MarkModelDead(model, FaultMessage(body))
+		}
 		return
 	}
 

@@ -218,6 +218,26 @@ func TestFatalRequestStopsOn404(t *testing.T) {
 	_ = strings.TrimSpace
 }
 
+// TestReportFailureNoDeadSkipsLedger 非对话端点的 404 不写模型台账。
+// 实测 embeddings 用 chat 模型会回 `404 page not found`，照对话口径处理会
+// 把 spark-x2.6 从 /v1/models 隐藏 30 天。
+func TestReportFailureNoDeadSkipsLedger(t *testing.T) {
+	p := newTestPool()
+	bal := int64(1000)
+	a := &Account{Name: "a1", Enabled: true, Available: &bal}
+	p.Add(a)
+
+	p.ReportFailureNoDead(a, 404, "404 page not found", "", "spark-x2.6")
+	if got := p.DeadModels(); len(got) != 0 {
+		t.Fatalf("非对话端点 404 不该入台账：%+v", got)
+	}
+	// 对照组：对话端点的同一个 404 仍然要入台账
+	p.ReportFailure(a, 404, "该模型暂未开放", "", "spark-x2.6")
+	if got := p.DeadModels(); len(got) != 1 {
+		t.Fatalf("对话端点 404 应入台账，实际 %d 条", len(got))
+	}
+}
+
 func names(list []*Account) []string {
 	out := make([]string, 0, len(list))
 	for _, a := range list {
