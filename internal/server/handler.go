@@ -1004,6 +1004,11 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 					usageObj, _ = obj["usage"].(map[string]any)
 				}
 				pts, prompt, completion, reasoning := usageParts(usageObj)
+				// 图像生成没有 usage 对象，扣分在响应**顶层** points_consumed。
+				// 不兜这一层，面板的 points_used 会永远是 0（实测 7 张图 770 分全漏记）。
+				if pts == 0 && obj != nil {
+					pts = int64(numOf(obj["points_consumed"]))
+				}
 				h.Pool.ReportSuccess(acc, "", model, pts)
 				h.record(usage.Record{
 					Account: acc.Name, Model: model, Kind: kind, Status: 200,

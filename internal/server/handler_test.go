@@ -863,6 +863,37 @@ func TestImageModelStillRoutesToImages(t *testing.T) {
 	}
 }
 
+// TestImageGenerationRecordsPoints 生图把扣分放在响应顶层 points_consumed（没有 usage 对象），
+// 网关必须兜这一层；否则面板 points_used 恒为 0。实测 7 张图 770 分全漏记。
+func TestImageGenerationRecordsPoints(t *testing.T) {
+	fs := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"Hy-Image-3.5-preview","type":"image"}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"created":1,"data":[{"url":"https://example.com/a.png"}],"points_consumed":110}`)
+	})
+	h, p, _ := newTestHandler(t, fs.srv.URL, nil)
+	if list := h.Models.Get(context.Background(), "sess"); len(list) != 1 {
+		t.Fatalf("目录预热失败：%d 个模型", len(list))
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"Hy-Image-3.5-preview","prompt":"a cat"}`))
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("生图请求失败：%d %s", w.Code, w.Body.String())
+	}
+	accs := p.All()
+	if len(accs) != 1 {
+		t.Fatalf("账号数 %d", len(accs))
+	}
+	if accs[0].PointsUsed != 110 {
+		t.Errorf("生图扣分入账 = %d，期望 110", accs[0].PointsUsed)
+	}
+}
+
 // TestModelsMarksImageEndpoint /v1/models 里图像模型要带 endpoint / supports_chat=false，
 // 对话模型不带——客户端才能据此决定调到哪个端点。
 func TestModelsMarksImageEndpoint(t *testing.T) {
