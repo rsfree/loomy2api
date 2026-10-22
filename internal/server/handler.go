@@ -1011,12 +1011,9 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 			// 生图 400 多为客户端带了下游 provider 不认的扩展字段（见 imageslim.go）：
 			// 第一次先按白名单减肥重试，避免把「请求有误」直接抛给用户。
 			if resp.Status == http.StatusBadRequest && kind == "image" {
-				var dropped []string
-				resp, payload, dropped = h.shrinkImageRetry(r.Context(), suffix, acc.Session, payload, resp)
-				if len(dropped) > 0 {
-					h.logCall(acc, model, resp.Status, time.Since(started),
-						"生图请求已精简字段 "+strings.Join(dropped, ","), h.requestIP(r))
-				}
+				// 去掉哪些字段已由 shrinkImageRetry 打日志；这里不再额外写请求行，
+				// 否则一次请求会同时出现「已精简」和「200 points=…」两行。
+				resp, payload, _ = h.shrinkImageRetry(r.Context(), suffix, acc.Session, payload, resp)
 			}
 			out := resp.BodyText()
 			h.Pool.Release(acc)
