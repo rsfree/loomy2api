@@ -174,7 +174,7 @@ curl http://127.0.0.1:17890/v1/responses \
 | POST | `/v1/messages` | Anthropic | Claude Code 等（也接受 `/messages`） |
 | GET | `/v1/models` | OpenAI | 模型目录（上游优先，失败回落内置表）；图像模型带 `endpoint` / `supports_chat=false` |
 | POST | `/v1/embeddings` | OpenAI | 向量 |
-| POST | `/v1/images/generations` | OpenAI | 生图 / 图生图（`image` 支持 URL、data URI、**数组多图**） |
+| POST | `/v1/images/generations` | OpenAI | 生图 / 图生图（`image` 支持 URL、data URI，**单图**；多图会被上游丢弃，网关只取第一张并回 `X-Loomy-Image-Warn`） |
 | POST | `/v1/images/edits` | OpenAI | 同上，multipart 前门（`image` / `image[]` 文件、`mask`） |
 | POST | `/v1/search` | — | 内置联网检索通道 |
 | GET | `/v1/points` | — | 全池额度 |
@@ -195,9 +195,17 @@ curl http://127.0.0.1:17890/v1/responses \
 
 ### 生图三个坑（上游都是**静默**处理，不报错）
 
-1. **`image` 形态**：单图请传字符串。数组只用于多图合成——`generations` 直通路径会把单元素数组
-   压成字符串再转发（`edits` / `chat` / `responses` 前门一直如此，`generations` 曾漏过这一步）。
-   传 `["url"]` 时上游可能把它当成「没传参考图」，出图成功但和原图毫无关系。
+1. **`image` 只能单图，且要传字符串**（实测 2026-10-22，5-lite，逐张 110 分）：
+
+   | 请求形态 | 结果 |
+   |---|---|
+   | `"image": "url"` | 忠实垫图（dhash≈1，NCC≈0.998，就是原图的高清版） |
+   | `"image": ["url"]` | 参考图被丢，出图与原图无关 |
+   | `"image": ["a","b"]` / `["b","a"]` / `["a","a"]` | 参考图被**整体丢弃**，退化成纯文生图（出无关人脸） |
+
+   即上游**没有多图合成能力**，数组形态等于没传图。网关现在把单元素数组压成字符串、
+   多图只取第一张，并在响应头挂 `X-Loomy-Image-Warn: multi-image-unsupported-used-first`
+   —— 宁可给你一张保住主体的图 + 明确警告，也不静默吞掉 110 分出一张陌生脸。
 2. **模型名被静默替换**：目录外的名字（如 `doubao-seedream-5-0-260128`）会按家族前缀回退到同族
    最高版（常见是 `doubao-seedream-5-lite`）。换模型后图生图能力未必还在。回退现在会回显在
    响应头 `X-Loomy-Model-Fallback: <请求名> -> <实际名>`，实际模型见 `X-Loomy-Model`；

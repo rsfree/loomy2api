@@ -5,10 +5,12 @@
 // 把 multipart 归一成同一个 canonical JSON（image 可以是字符串或数组、mask 原样），
 // 再交给 generations 那条透传管道——选号、冷却、记账、模型校验全部复用。
 //
-// 实测上游（2026-10-22）：
-//   - `image` 传数组 = 多图输入，主体能同时保留（两张参考图成功合成）；
-//   - `image` 传 URL 或 data URI 都可以；
-//   - 字段本身是透传的，未知字段上游会忽略。
+// 实测上游（2026-10-22，逐张 110 分核对过）：
+//   - `image` 传字符串（URL 或 data URI）才有图生图效果，原图主体完整保留；
+//   - `image` 传数组 = 参考图**整体被丢弃**，`["url"]` / `["a","b"]` / `["a","a"]`
+//     都会退化成纯文生图（出与原图无关的人脸）。多图合成能力不存在，
+//     所以归一后一律只发第一张的字符串形态（见 normalizeImageField）；
+//   - 未知字段上游会忽略（但 `seed` / `watermark` 这类可能触发 400，见 imageslim.go）。
 package server
 
 import (
@@ -17,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -204,34 +207,42 @@ func parseMultipartImage(r *http.Request, requireImage bool) (map[string]any, er
 	return payload, nil
 }
 
-// normalizeImageField 把 image 收敛成上游认识的最小形态：
-// 单元素数组压成字符串，空值直接删掉，多图数组保持不动。
+// normalizeImageField 把 image 收敛成上游真正能吃下的形态，并返回给客户端看的
+// 警告码（空 = 无需告警）。
 //
-// 为什么要这一层：edits / chat / responses 三个前门早就归一过，但
-// generations 是直通（body 原样转发），`"image": ["url"]` 会原封不动上去。
-// 上游对数组形态不报错、只是把参考图丢掉——出图成功但完全不像原图，
-// 也就是「垫图没生效」。同一个垫图走不同前门结果不同，这种不一致必须在
-// 网关侧收口。
-func normalizeImageField(payload map[string]any) {
+// 实测口径（2026-10-22，doubao-seedream-5-lite，各 110 分/张）：
+//   - `"image": "url"`            → 忠实保留原图（dhash≈1，NCC≈0.998）
+//   - `"image": ["url"]`          → 单元素数组同样被丢参考图 → 出图与原图无关
+//   - `"image": ["a","b"]`        → 参考图**整体被丢弃**，退化成纯文生图
+//     （a,b 都出无关人脸；`["a","a"]` 也一样，与顺序无关）
+//
+// 所以：单元素数组压成字符串（这是「垫图不生效」的直接成因），多图取第一张
+// 并告警——宁可给用户一张保留了主体的图 + 明确的警告头，也不要静默吞掉 110 分
+// 出一张陌生脸。「多图合成」在本上游不存在。
+func normalizeImageField(payload map[string]any) string {
 	if payload == nil {
-		return
+		return ""
 	}
 	// 空白字符串：imageList 会当成「错误」以便 edits 前门回 400，
 	// 但直通路径上更合理的是视同没传图。
 	if s, ok := payload["image"].(string); ok && strings.TrimSpace(s) == "" {
 		delete(payload, "image")
-		return
+		return ""
 	}
 	images, err := imageList(payload["image"])
 	if err != nil {
-		return // 类型不对就原样透传，让上游自己给出报错
+		return "" // 类型不对就原样透传，让上游自己给出报错
 	}
 	switch len(images) {
 	case 0:
 		delete(payload, "image")
 	case 1:
 		payload["image"] = images[0]
+	default:
+		payload["image"] = images[0]
+		return "multi-image-unsupported-used-first"
 	}
+	return ""
 }
 
 // imageNote 给日志补一句「这次请求带了参考图」，回退模型时能一眼看出
@@ -468,6 +479,11 @@ func imagePayload(req map[string]any, model, prompt string, images []string) map
 			arr[i] = s
 		}
 		p["image"] = arr
+	}
+	// 多图在本上游不吃（见 normalizeImageField）：聊天前门也走同一条收敛，
+	// 只保留第一张，别再让上游静默丢图。
+	if warn := normalizeImageField(p); warn != "" {
+		log.Printf("[image] 对话前门带多张参考图；上游只支持单图垫图，已改用第一张（%s）", warn)
 	}
 	if n, ok := req["n"]; ok {
 		p["n"] = n

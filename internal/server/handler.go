@@ -975,7 +975,10 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 		if kind == "image" {
 			// 参考图先归一（见 normalizeImageField）：上游对 image 数组不报错但会
 			// 静默丢弃参考图，必须在转发前把形态收敛掉。
-			normalizeImageField(payload)
+			if warn := normalizeImageField(payload); warn != "" {
+				log.Printf("[image] 请求带多张参考图；上游只支持单图垫图，已改用第一张（%s）", warn)
+				w.Header().Set("X-Loomy-Image-Warn", warn)
+			}
 			var replaced string
 			model, replaced = h.resolveImageModel(r.Context(), payload)
 			if replaced != "" {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -47,8 +48,10 @@ func TestImageSingleElementArrayBecomesString(t *testing.T) {
 	}
 }
 
-// TestImageMultiElementArrayKept 多图输入仍要发数组（顺序是语义的一部分）。
-func TestImageMultiElementArrayKept(t *testing.T) {
+// TestImageMultiElementArrayUsesFirst 多图在本上游等于「没有参考图」：
+// 实测 `["a","b"]`、`["b","a"]`、`["a","a"]` 全部出与原图无关的人脸（参考图整体
+// 被丢弃）。所以网关只取第一张并挂警告头——不能把多图原样送给上游静默吞分。
+func TestImageMultiElementArrayUsesFirst(t *testing.T) {
 	fs := imageFallbackUpstream(t)
 	h, _, _ := newTestHandler(t, fs.srv.URL, nil)
 	_ = h.Models.Get(context.Background(), "sess")
@@ -62,9 +65,45 @@ func TestImageMultiElementArrayKept(t *testing.T) {
 		t.Fatalf("状态码 %d：%s", w.Code, w.Body.String())
 	}
 	v, _ := upstreamImage(t, fs)
-	arr, ok := v.([]any)
-	if !ok || len(arr) != 2 || arr[0] != "https://example.com/a.jpg" || arr[1] != "https://example.com/b.jpg" {
-		t.Errorf("多图数组被改坏了：%#v", v)
+	if s, ok := v.(string); !ok || s != "https://example.com/a.jpg" {
+		t.Errorf("多图应退化成第一张的字符串：%#v", v)
+	}
+	if got := w.Header().Get("X-Loomy-Image-Warn"); got != "multi-image-unsupported-used-first" {
+		t.Errorf("多图必须回警告头，得到 %q", got)
+	}
+}
+
+// TestNormalizeImageField 归一函数的表驱动用例（含边界：空值、空白串、类型错）。
+func TestNormalizeImageField(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+		want any // nil = 字段应被删掉
+		warn string
+	}{
+		{"字符串原样", "https://a/1.jpg", "https://a/1.jpg", ""},
+		{"单元素数组压字符串", []any{"https://a/1.jpg"}, "https://a/1.jpg", ""},
+		{"多图取第一张并告警", []any{"https://a/1.jpg", "https://a/2.jpg"}, "https://a/1.jpg", "multi-image-unsupported-used-first"},
+		{"空数组删字段", []any{}, nil, ""},
+		{"空白串删字段", "   ", nil, ""},
+		{"类型不支持时不动", map[string]any{"url": "x"}, map[string]any{"url": "x"}, ""},
+	}
+	for _, c := range cases {
+		payload := map[string]any{"image": c.in}
+		warn := normalizeImageField(payload)
+		if warn != c.warn {
+			t.Errorf("%s：警告码 %q，期望 %q", c.name, warn, c.warn)
+		}
+		got, ok := payload["image"]
+		if c.want == nil {
+			if ok {
+				t.Errorf("%s：字段应被删除，仍是 %#v", c.name, got)
+			}
+			continue
+		}
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s：得到 %#v，期望 %#v", c.name, got, c.want)
+		}
 	}
 }
 
