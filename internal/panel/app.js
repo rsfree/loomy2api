@@ -1122,7 +1122,7 @@ const CFG_MAP = {
   sticky_ttl_seconds: 'sticky_ttl_seconds', sticky_max_entries: 'sticky_max_entries',
   sessions_from_client: 'sessions_from_client', identity_mode: 'identity_mode',
   quota_refresh_minutes: 'quota_refresh_minutes',
-  session_renew_before_days: 'session_renew_before_days',
+  session_renew_before_days: 'session_renew_before_days', auto_relogin: 'auto_relogin',
   keepalive_min_tokens: 'keepalive_min_tokens',
   soft_rate_base_seconds: 'soft_rate_base_seconds', soft_rate_max_seconds: 'soft_rate_max_seconds',
   cooldown_seconds: 'cooldown_seconds', not_found_cooldown_seconds: 'not_found_cooldown_seconds',

@@ -99,7 +99,9 @@
   "_sticky_max_entries": "粘性表容量上限",
 
   "session_renew_before_days": 3,
-  "_session_renew_before_days": "登录态剩余天数低于此值时在日志里告警（上游无 refresh token，只能重登）",
+  "_session_renew_before_days": "登录态剩余天数低于此值时告警并触发自动重登",
+  "auto_relogin": true,
+  "_auto_relogin": "有密码的账号在到期前自动重登（滚动 14 天）；纯 session 卡密号无法续期",
 
   "quota_refresh_minutes": 30,
   "_quota_refresh_minutes": "后台全量额度刷新间隔（分钟）",

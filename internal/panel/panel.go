@@ -46,6 +46,10 @@ type Panel struct {
 	locksMu sync.Mutex
 	locks   map[string]*sync.Mutex
 
+	// 自动重登的失败节流：同一账号 renewRetry 内只尝试一次。
+	renewMu    sync.Mutex
+	renewTried map[string]time.Time
+
 	started time.Time
 }
 
@@ -318,13 +322,27 @@ func (p *Panel) addAccount(w http.ResponseWriter, r *http.Request) {
 		Session  string `json:"session"`
 		Proxy    string `json:"proxy"`
 		Login    bool   `json:"login"`
+		// 以下字段兼容卡密原样投喂：平台常给 phone / nickname / userid 与
+		// updatedAt（毫秒），没有 name/loginid 时自动兜底，时间用来校正剩余有效期。
+		Phone      string `json:"phone"`
+		Nickname   string `json:"nickname"`
+		UserID     string `json:"userid"`
+		ObtainedAt int64  `json:"obtainedAt"`
+		UpdatedAt  int64  `json:"updatedAt"`
+		ExpireAt   int64  `json:"expireAt"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "请求体解析失败: "+err.Error())
 		return
 	}
 	body.LoginID = strings.TrimSpace(body.LoginID)
+	if body.LoginID == "" {
+		body.LoginID = strings.TrimSpace(body.Phone)
+	}
 	body.Name = strings.TrimSpace(body.Name)
+	if body.Name == "" {
+		body.Name = strings.TrimSpace(body.Nickname)
+	}
 	if body.Name == "" {
 		body.Name = body.LoginID
 	}
@@ -340,6 +358,7 @@ func (p *Panel) addAccount(w http.ResponseWriter, r *http.Request) {
 	acc := &pool.Account{
 		Name:     body.Name,
 		LoginID:  body.LoginID,
+		UserID:   strings.TrimSpace(body.UserID),
 		Password: body.Password,
 		Proxy:    body.Proxy,
 		Enabled:  true,
@@ -347,8 +366,11 @@ func (p *Panel) addAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Session != "" {
 		acc.Session = body.Session
-		acc.ObtainedAt = time.Now().Unix()
-		acc.ExpireAt = acc.ObtainedAt + account.SessionExpireSeconds
+		acc.ObtainedAt, acc.ExpireAt = importExpiry(time.Now(), body.ObtainedAt, body.UpdatedAt, body.ExpireAt)
+		if acc.ExpireAt <= time.Now().Unix() {
+			p.Logf("账号 %s 导入的登录态已过期（到期 %s），请尽快换卡或改用密码登录",
+				acc.Name, time.Unix(acc.ExpireAt, 0).Format("2006-01-02 15:04"))
+		}
 	}
 	p.pool.Add(acc)
 

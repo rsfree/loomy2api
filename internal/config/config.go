@@ -113,14 +113,17 @@ type Config struct {
 	BreakerBaseSeconds  int `json:"breaker_cooldown_seconds"`
 	BreakerMaxSeconds   int `json:"breaker_cooldown_max_seconds"`
 
-	Strategy            string `json:"strategy"`
-	PickTopN            int    `json:"pick_top_n"`
-	MaxInFlight         int    `json:"max_inflight_per_account"`
-	StickyTTLSeconds    int    `json:"sticky_ttl_seconds"`
-	StickyMaxEntries    int    `json:"sticky_max_entries"`
-	SessionRenewDays    int    `json:"session_renew_before_days"`
-	QuotaRefreshMinutes int    `json:"quota_refresh_minutes"`
-	BalanceFloor        int    `json:"balance_floor"` // 可用积分低于此值停止接单（0=关闭）
+	Strategy         string `json:"strategy"`
+	PickTopN         int    `json:"pick_top_n"`
+	MaxInFlight      int    `json:"max_inflight_per_account"`
+	StickyTTLSeconds int    `json:"sticky_ttl_seconds"`
+	StickyMaxEntries int    `json:"sticky_max_entries"`
+	SessionRenewDays int    `json:"session_renew_before_days"`
+	// AutoRelogin 登录态剩余不足 SessionRenewDays 天时，用手机号 + 密码自动重登，
+	// 把 14 天有效期滚动续上（只对有密码的账号生效；上游没有 refresh token）。
+	AutoRelogin         bool `json:"auto_relogin"`
+	QuotaRefreshMinutes int  `json:"quota_refresh_minutes"`
+	BalanceFloor        int  `json:"balance_floor"` // 可用积分低于此值停止接单（0=关闭）
 	// PreferDaily 选号优先花「今日赠送额度」（按自然日清零），再动永久积分。
 	// 上游不会因赠送额度耗尽报错（静默改扣永久积分、照常 200），只能靠排序实现。
 	PreferDaily bool `json:"prefer_daily_quota"`
@@ -178,6 +181,7 @@ func Defaults() *Config {
 		StickyTTLSeconds:    1800,
 		StickyMaxEntries:    2000,
 		SessionRenewDays:    3,
+		AutoRelogin:         true,
 		QuotaRefreshMinutes: 30,
 		BalanceFloor:        0,
 		PreferDaily:         true,

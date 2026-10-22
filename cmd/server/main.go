@@ -182,6 +182,11 @@ func background(cfg *config.Config, p *pool.Pool, up *upstream.Client, pl *panel
 				expiredWarned[a.Name] = today
 				log.Printf("⚠️  账号 %s 登录态将在 %.1f 小时内过期（阈值 %d 天），请重新登录", a.Name, d*24, warnDays)
 			}
+			// 有密码的账号直接自动重登，把 14 天有效期滚动续上；
+			// 纯 session 的卡密号没有 refresh token，只能等告警后换卡。
+			if ok, bad := pl.AutoRenew(time.Now()); ok+bad > 0 {
+				log.Printf("登录态自动续期：成功 %d，失败 %d", ok, bad)
+			}
 		case <-quota.C:
 			refreshQuotas(p, up)
 		}
