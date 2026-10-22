@@ -66,6 +66,7 @@ Loomy2API 是一个自托管的**反向代理网关**，把讯飞 Loomy（`loomy
 | 🆓 **限免与倍率识别** | 上游 `/models` 没有结构化倍率字段，倍率与「限时免费」都写在展示名里（`Spark-X2.6-preview(限时免费)(x0.0)`），网关解析后由面板渲染「限免」标签 |
 | 🖼️ **图像模型多端点** | `type=image` 的模型支持 `/v1/images/generations`、`/v1/images/edits`（multipart / JSON），也可走 `/v1/chat/completions` 与 `/v1/responses` 前门（自动折成 prompt + 参考图），支持单图与**多图数组** |
 | 🪄 **生图模型自动归并** | 生图端点（`generations` / `edits`）先精确匹配目录，未命中再按**家族前缀**找同族图像模型（`doubao-seedream-4-0-250828` → `doubao-seedream-5-lite`、`qwen-image-2.5` → `qwen-image-3.0-pro`，同族取版本最高），最后才用 `image_fallback_model` 兜底。对话端点仍严格 404，不会把拼错的对话模型变成一次生图 |
+| 🧹 **生图 400 自动精简** | 客户端把 Seedream 4.5 / 新版生图参数原样发来时（`stream`、`sequential_image_generation`、`watermark`、`seed`、`n>1`），下游 provider 会回「请求有误」；网关自动去掉非核心字段重试，仍失败再退到 `model/prompt/image/size`，并把被丢字段写进日志 |
 | 🔄 **多账号池** | 余额加权 + 成本分层 + 加权随机选号，Top-5 候选 + 防惊群；**每日赠送额度优先**（按自然日清零的那份先花） |
 | 🛡️ **熔断与冷却** | 429 软冷却指数退避（封顶可配）、404 短冷却、额度耗尽硬冷却到次日 00:00、连败熔断、单号在途租约 |
 | 🧲 **会话粘性** | 同一会话绑定同一账号，TTL 滚动续期，失败自动解绑；用**最后一条 user 消息**派生会话键，多轮对话不会永久锁死单号 |
