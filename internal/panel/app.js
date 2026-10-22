@@ -1116,7 +1116,7 @@ $('btnLogPin').onclick = () => {
 /* CFG_MAP：面板字段 → config.json 键。Loomy 配置是扁平 JSON（蓝本是嵌套分组），
    直接键名映射；api_keys 走专用控件（脱敏值不下发，见下）。面板登录与 /v1/* 用同一把 key。 */
 const CFG_MAP = {
-  listen: 'listen', default_model: 'default_model', strategy: 'strategy',
+  listen: 'listen', default_model: 'default_model', image_fallback_model: 'image_fallback_model', strategy: 'strategy',
   pick_top_n: 'pick_top_n', max_inflight_per_account: 'max_inflight_per_account',
   balance_floor: 'balance_floor',
   sticky_ttl_seconds: 'sticky_ttl_seconds', sticky_max_entries: 'sticky_max_entries',

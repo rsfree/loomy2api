@@ -65,6 +65,7 @@ Loomy2API 是一个自托管的**反向代理网关**，把讯飞 Loomy（`loomy
 | 🧩 **模型名别名** | 请求名先归一成目录里的标准 id：**精确匹配优先**，否则取**最长前缀**（`deepseek-v4.1-flash-xxx` → `DeepSeek-V4.1-Flash`）。前缀后必须是分隔符，拼错的名字（`spark-xylophone`）仍 404，并在文案里提示最接近的模型 |
 | 🆓 **限免与倍率识别** | 上游 `/models` 没有结构化倍率字段，倍率与「限时免费」都写在展示名里（`Spark-X2.6-preview(限时免费)(x0.0)`），网关解析后由面板渲染「限免」标签 |
 | 🖼️ **图像模型多端点** | `type=image` 的模型支持 `/v1/images/generations`、`/v1/images/edits`（multipart / JSON），也可走 `/v1/chat/completions` 与 `/v1/responses` 前门（自动折成 prompt + 参考图），支持单图与**多图数组** |
+| 🪄 **生图模型自动归并** | 生图端点（`generations` / `edits`）先精确匹配目录，未命中再按**家族前缀**找同族图像模型（`doubao-seedream-4-0-250828` → `doubao-seedream-5-lite`、`qwen-image-2.5` → `qwen-image-3.0-pro`，同族取版本最高），最后才用 `image_fallback_model` 兜底。对话端点仍严格 404，不会把拼错的对话模型变成一次生图 |
 | 🔄 **多账号池** | 余额加权 + 成本分层 + 加权随机选号，Top-5 候选 + 防惊群；**每日赠送额度优先**（按自然日清零的那份先花） |
 | 🛡️ **熔断与冷却** | 429 软冷却指数退避（封顶可配）、404 短冷却、额度耗尽硬冷却到次日 00:00、连败熔断、单号在途租约 |
 | 🧲 **会话粘性** | 同一会话绑定同一账号，TTL 滚动续期，失败自动解绑；用**最后一条 user 消息**派生会话键，多轮对话不会永久锁死单号 |
@@ -213,6 +214,7 @@ curl http://127.0.0.1:17890/v1/responses \
 | `balance_floor` | `0` | 积分保底：可用积分 ≤ 此值停止接单（0 = 关闭） |
 | `prefer_daily_quota` | `true` | 优先花每日赠送额度，再动长期积分 |
 | `strict_model_check` | `true` | 不在目录里的模型直接 404，不打上游（目录匹配支持最长前缀别名） |
+| `image_fallback_model` | `doubao-seedream-5-lite` | 生图端点「同族前缀也对不上」时的最后兜底；留空 = 关闭（仍 404） |
 | `dead_model_ttl_days` | `30` | 失效模型台账 TTL |
 | `sticky_ttl_seconds` | `1800` | 会话粘性 TTL（0 = 关闭） |
 | `soft_rate_base_seconds` / `_max_` | `600` / `7200` | 429 软冷却基数与封顶 |

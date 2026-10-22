@@ -971,7 +971,16 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 				return
 			}
 		}
-		model := h.resolveModel(r.Context(), payload)
+		var model string
+		if kind == "image" {
+			var replaced string
+			model, replaced = h.resolveImageModel(r.Context(), payload)
+			if replaced != "" {
+				log.Printf("[image] 模型 %q 不在目录，回退到 %s", replaced, model)
+			}
+		} else {
+			model = h.resolveModel(r.Context(), payload)
+		}
 		if h.rejectUnknownModel(w, model) {
 			return
 		}
@@ -1098,6 +1107,75 @@ func (h *Handler) resolveModel(ctx context.Context, payload map[string]any) stri
 		liftMaxTokens(payload)
 	}
 	return model
+}
+
+// resolveImageModel 图像端点的模型解析：在普通解析之上加两层兜底。
+//
+//  1. 目录里有 → 用目录里的标准 id（精确优先，其次最长前缀，见 matchCatalog）；
+//  2. 目录里没有 → 按**家族前缀**找同族图像模型（doubao-seedream-4-0-250828 →
+//     doubao-seedream-5-lite、qwen-image-2.5 → qwen-image-3.0-pro），同族多个取版本最高；
+//  3. 连家族都对不上 → 用配置的 image_fallback_model（默认 doubao-seedream-5-lite）。
+//
+// 对话端点不走这条路：上游对认不出的模型名会静默用默认模型执行并照常扣分，
+// 所以拼错的对话模型必须 404，不能变成一次生图。
+//
+// 返回最终模型与「被替换掉的原始名字」（空串表示没替换）。
+func (h *Handler) resolveImageModel(ctx context.Context, payload map[string]any) (string, string) {
+	raw := strings.TrimSpace(str(payload["model"]))
+	fb := h.imageFallbackModel(ctx)
+	if raw == "" {
+		if fb == "" {
+			return h.resolveModel(ctx, payload), ""
+		}
+		// 生图请求没写 model：默认模型往往是对话模型，这里直接用图像兜底。
+		// 不额外记日志——请求行里的 model 已经是兜底后的名字。
+		payload["model"] = fb
+		return fb, ""
+	}
+
+	model := h.resolveModel(ctx, payload)
+	if h.catalogHas(ctx, model) {
+		return model, ""
+	}
+
+	target := ""
+	if m, ok := familyFallback(h.catalog(ctx), raw); ok {
+		target = m.ID
+	}
+	if target == "" {
+		target = fb
+	}
+	if target == "" {
+		return model, ""
+	}
+	payload["model"] = target
+	// 回显客户端原本写的名字：resolveModel 可能已经补过 imodel/ 前缀。
+	return target, raw
+}
+
+// catalogModelID 把名字归一成目录 id；目录还没拉到时按原样返回（冷启窗口）。
+// 目录里确实没有这个模型时返回空串——宁可直接 404，也不发一个不存在的名字。
+func (h *Handler) catalogModelID(ctx context.Context, name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if m, ok := h.matchModel(ctx, name); ok {
+		return m.ID
+	}
+	if h.Models == nil || len(h.Models.Cached()) == 0 {
+		return name
+	}
+	return ""
+}
+
+// imageFallbackModel 返回配置的图像通用兜底模型（归一成目录 id）。
+// 未配置、或目录里已经没有这个模型时返回空串。
+func (h *Handler) imageFallbackModel(ctx context.Context) string {
+	if h.Cfg == nil {
+		return ""
+	}
+	return h.catalogModelID(ctx, h.Cfg.ImageFallbackModel)
 }
 
 // catalog 取模型目录，**只读缓存**：对话热路径不该为了一次类型判断去等一趟上游。

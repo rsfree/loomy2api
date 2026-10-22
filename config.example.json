@@ -37,6 +37,9 @@
   "_proxy": "全局出口代理，如 http://127.0.0.1:7890；账号级 proxy 可覆盖",
 
   "default_model": "imodel/deepseek-v4-flash-0731",
+  "_default_model": "请求未写 model 时的对话模型",
+  "image_fallback_model": "doubao-seedream-5-lite",
+  "_image_fallback_model": "图像端点的最后兜底：先精确匹配，再按家族前缀（doubao-seedream-4.0→5-lite），都对不上才用它；空 = 关闭（仍 404）",
   "strip_model_prefix": true,
   "_strip_model_prefix": "模型名缺 provider 前缀时自动补 imodel/",
 

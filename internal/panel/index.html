@@ -1039,6 +1039,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="hr"></div>
             <div class="grid3">
               <label class="fld"><span class="lb">默认模型</span><input name="default_model" placeholder="imodel/deepseek-v4-flash-0731"></label>
+              <label class="fld"><span class="lb">图像兜底模型</span><input name="image_fallback_model" placeholder="doubao-seedream-5-lite"><span class="hint">生图端点遇到未知模型名时回退；留空 = 直接 404</span></label>
               <label class="fld"><span class="lb">选号策略</span>
                 <select name="strategy">
                   <option value="weighted">weighted 加权</option>

@@ -93,10 +93,14 @@ type Config struct {
 	LoomyVersion string `json:"loomy_version"`
 	Proxy        string `json:"proxy"`
 
-	DefaultModel  string `json:"default_model"`
-	StripPrefix   bool   `json:"strip_model_prefix"`
-	TimeoutSecond int    `json:"timeout_seconds"`
-	MaxRetries    int    `json:"max_retries"`
+	DefaultModel string `json:"default_model"`
+	// ImageFallbackModel 图像端点遇到目录里没有的模型名时回退到它（空 = 关闭兜底，仍 404）。
+	// 生图客户端常把厂商版本号写死（doubao-seedream-4-0-250828），这些 id 在 Loomy
+	// 目录里并不存在；生图端点回退到固定图像模型比直接 404 或让上游拿默认对话模型去生图更合理。
+	ImageFallbackModel string `json:"image_fallback_model"`
+	StripPrefix        bool   `json:"strip_model_prefix"`
+	TimeoutSecond      int    `json:"timeout_seconds"`
+	MaxRetries         int    `json:"max_retries"`
 	// 非流式且 max_tokens ≥ 该值时，内部改走流式再聚合：上游对长时间无响应的
 	// 非流式请求约 60s 就回 504，流式同模型能跑几分钟。
 	KeepaliveMinTokens int `json:"keepalive_min_tokens"`
@@ -153,10 +157,11 @@ func Defaults() *Config {
 		AccountAppID: DefaultAccountApp,
 		LoomyVersion: DefaultLoomyVersion,
 
-		DefaultModel:  "imodel/deepseek-v4-flash-0731",
-		StripPrefix:   true,
-		TimeoutSecond: 3600,
-		MaxRetries:    2,
+		DefaultModel:       "imodel/deepseek-v4-flash-0731",
+		ImageFallbackModel: "doubao-seedream-5-lite",
+		StripPrefix:        true,
+		TimeoutSecond:      3600,
+		MaxRetries:         2,
 
 		KeepaliveMinTokens: 1500,
 
