@@ -973,11 +973,19 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 		}
 		var model string
 		if kind == "image" {
+			// 参考图先归一（见 normalizeImageField）：上游对 image 数组不报错但会
+			// 静默丢弃参考图，必须在转发前把形态收敛掉。
+			normalizeImageField(payload)
 			var replaced string
 			model, replaced = h.resolveImageModel(r.Context(), payload)
 			if replaced != "" {
-				log.Printf("[image] 模型 %q 不在目录，回退到 %s", replaced, model)
+				log.Printf("[image] 模型 %q 不在目录，回退到 %s%s", replaced, model, imageNote(payload))
+				// 回退必须对客户端可见：模型被静默替换是「垫图不生效」的头号原因，
+				// 只写日志的话调用方永远看不出自己拿到的不是所要的模型。
+				w.Header().Set("X-Loomy-Model-Fallback", replaced+" -> "+model)
 			}
+			// 实际使用的上游模型（回退后是回退目标），供排查与对齐。
+			w.Header().Set("X-Loomy-Model", model)
 		} else {
 			model = h.resolveModel(r.Context(), payload)
 		}

@@ -193,6 +193,18 @@ curl http://127.0.0.1:17890/v1/responses \
 
 鉴权同时接受 `Authorization: Bearer <key>` 与 `x-api-key: <key>`。
 
+### 生图三个坑（上游都是**静默**处理，不报错）
+
+1. **`image` 形态**：单图请传字符串。数组只用于多图合成——`generations` 直通路径会把单元素数组
+   压成字符串再转发（`edits` / `chat` / `responses` 前门一直如此，`generations` 曾漏过这一步）。
+   传 `["url"]` 时上游可能把它当成「没传参考图」，出图成功但和原图毫无关系。
+2. **模型名被静默替换**：目录外的名字（如 `doubao-seedream-5-0-260128`）会按家族前缀回退到同族
+   最高版（常见是 `doubao-seedream-5-lite`）。换模型后图生图能力未必还在。回退现在会回显在
+   响应头 `X-Loomy-Model-Fallback: <请求名> -> <实际名>`，实际模型见 `X-Loomy-Model`；
+   不想被回退就开 `strict_model_check`，让目录外的名字直接 404。
+3. **`sequential_image_generation`**：这是组图开关（`auto` + `max_images`），超分 / 保主体这类
+   单图图生图场景建议不要带，容易让上游走进「一次出多张」的分支。
+
 ## 配置
 
 配置是单个 `config.json`，首次启动自动生成（含 `crypto/rand` 随机 `api_key`）。

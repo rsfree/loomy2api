@@ -204,6 +204,46 @@ func parseMultipartImage(r *http.Request, requireImage bool) (map[string]any, er
 	return payload, nil
 }
 
+// normalizeImageField 把 image 收敛成上游认识的最小形态：
+// 单元素数组压成字符串，空值直接删掉，多图数组保持不动。
+//
+// 为什么要这一层：edits / chat / responses 三个前门早就归一过，但
+// generations 是直通（body 原样转发），`"image": ["url"]` 会原封不动上去。
+// 上游对数组形态不报错、只是把参考图丢掉——出图成功但完全不像原图，
+// 也就是「垫图没生效」。同一个垫图走不同前门结果不同，这种不一致必须在
+// 网关侧收口。
+func normalizeImageField(payload map[string]any) {
+	if payload == nil {
+		return
+	}
+	// 空白字符串：imageList 会当成「错误」以便 edits 前门回 400，
+	// 但直通路径上更合理的是视同没传图。
+	if s, ok := payload["image"].(string); ok && strings.TrimSpace(s) == "" {
+		delete(payload, "image")
+		return
+	}
+	images, err := imageList(payload["image"])
+	if err != nil {
+		return // 类型不对就原样透传，让上游自己给出报错
+	}
+	switch len(images) {
+	case 0:
+		delete(payload, "image")
+	case 1:
+		payload["image"] = images[0]
+	}
+}
+
+// imageNote 给日志补一句「这次请求带了参考图」，回退模型时能一眼看出
+// 是图生图被换了模型（换成不支持垫图的模型就是白扣分）。
+func imageNote(payload map[string]any) string {
+	images, err := imageList(payload["image"])
+	if err != nil || len(images) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("（请求含 %d 张参考图）", len(images))
+}
+
 // partDataURI 判断 part 内容是不是图片二进制，是则转 data URI。
 // 文本 URL 返回 false（调用方保留原文）。
 func partDataURI(data []byte) (string, bool) {
