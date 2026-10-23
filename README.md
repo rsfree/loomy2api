@@ -237,6 +237,27 @@ curl http://127.0.0.1:17890/v1/responses \
 对话前门（`/v1/chat/completions`、`/v1/responses`）认三种图片块拼法——
 `image_url` / `input_image` / `image`，值可以是字符串，也可以是 `{"url": "..."}`。
 
+### 端点 / 形态矩阵（2026-10-23 线上实测，9 次出图各 110 积分）
+
+测试图：参考 A = 品红圆形，参考 B = 青绿色方形；提示词**不描述颜色与形状**，
+再用像素统计核对输出，只有两种颜色同时出现才算「第二张真的生效」。
+
+| 端点 | 请求形态 | 结果 | 第二张是否生效 |
+|---|---|---|---|
+| `/v1/images/generations` | `image` 字符串（1 张） | 200 | 未适用（单图语义） |
+| `/v1/images/generations` | `image` 数组（2 张） | 200 | **生效** |
+| `/v1/images/generations` | `images` 数组（2 张） | 200 | **生效** |
+| `/v1/images/generations` | `images` 数组（1 张） | 200 | 未适用（单图语义） |
+| `/v1/images/edits`（JSON） | `image` 数组（2 张） | 200 | **生效** |
+| `/v1/images/edits`（multipart） | `image[]` 两个文件 | 200 | **生效** |
+| `/v1/chat/completions` | 2 个 `image_url` 内容块 | 200 | **生效** |
+| `/v1/responses` | 2 个 `input_image` 内容块 | 200 | **生效** |
+| `/v1/images/generations` | `qwen-image-3.0-pro` + `images`（2 张） | 200 | **生效** |
+| `/v1/messages` | 图像模型 | 400（指路到 generations，设计如此） | — |
+
+单图用例只出现品红、没有青绿，说明「单图语义」没有被多图污染；多图用例两种颜色
+像素占比都在 15%–23%，七个形态全部通过。
+
 ```bash
 # 多图合成：把两张参考图交给同一个模型
 curl http://127.0.0.1:17890/v1/images/generations \
