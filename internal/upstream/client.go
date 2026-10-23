@@ -459,6 +459,37 @@ func (c *Client) Quota(ctx context.Context, session string) (*Quota, error) {
 
 // Points 查询积分流水汇总（面板额度页）。
 func (c *Client) Points(ctx context.Context, session string, pages int) (map[string]any, error) {
+	out, err := c.Records(ctx, session, pages)
+	if err != nil {
+		return nil, err
+	}
+	// dailyQuota / dailyConsumed 不在 points/records 响应里，只有 first-login 提供。
+	// 这里只调 first-login（不调 Quota，否则会重复请求一轮 records）。
+	if fl, ferr := c.FirstLogin(ctx, session); ferr == nil {
+		data := mapOfAny(fl["data"])
+		if data == nil {
+			data = fl
+		}
+		if v := ptrI64(data["dailyQuota"]); v != nil {
+			out["daily_quota"] = *v
+		}
+		if v := ptrI64(data["dailyConsumed"]); v != nil {
+			out["daily_consumed"] = *v
+		}
+		if v := ptrI64(data["permanentBalance"]); v != nil {
+			out["permanent"] = *v
+		}
+		out["daily_cycle_date"] = str(data["dailyCycleDate"])
+	}
+	return out, nil
+}
+
+// Records 只取积分流水，**不触发** first-login。
+//
+// Points 会在取完流水后再调一次 points/first-login（为了拿 dailyQuota）——
+// 那是个有副作用的 POST（领每日奖励），面板的「积分账本」不需要它，也不该
+// 为了展示表格去反复触发奖励接口（121 个账号 × 每轮一次）。
+func (c *Client) Records(ctx context.Context, session string, pages int) (map[string]any, error) {
 	if pages < 1 {
 		pages = 5
 	}
@@ -524,7 +555,7 @@ func (c *Client) Points(ctx context.Context, session string, pages int) (map[str
 	if first == nil {
 		first = map[string]any{}
 	}
-	out := map[string]any{
+	return map[string]any{
 		"balance":       first["balance"],
 		"daily_balance": first["dailyBalance"],
 		"available":     first["availableBalance"],
@@ -532,26 +563,7 @@ func (c *Client) Points(ctx context.Context, session string, pages int) (map[str
 		"debits":        debits,
 		"credits":       credits,
 		"pages":         pages,
-	}
-	// dailyQuota / dailyConsumed 不在 points/records 响应里，只有 first-login 提供。
-	// 这里只调 first-login（不调 Quota，否则会重复请求一轮 records）。
-	if fl, err := c.FirstLogin(ctx, session); err == nil {
-		data := mapOfAny(fl["data"])
-		if data == nil {
-			data = fl
-		}
-		if v := ptrI64(data["dailyQuota"]); v != nil {
-			out["daily_quota"] = *v
-		}
-		if v := ptrI64(data["dailyConsumed"]); v != nil {
-			out["daily_consumed"] = *v
-		}
-		if v := ptrI64(data["permanentBalance"]); v != nil {
-			out["permanent"] = *v
-		}
-		out["daily_cycle_date"] = str(data["dailyCycleDate"])
-	}
-	return out, nil
+	}, nil
 }
 
 // FirstLogin 触发每日首次登录奖励（幂等：已领过返回 alreadyProcessed）。

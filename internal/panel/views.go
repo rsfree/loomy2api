@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -184,8 +185,8 @@ const (
 	// 121 个账号的流水全扫一遍（242 次上游调用），既慢又容易被上游限流。
 	creditCacheTTL    = 5 * time.Minute
 	creditFetchBudget = 20 * time.Second
-	creditCallTimeout = 6 * time.Second
-	creditConcurrency = 8
+	creditCallTimeout = 8 * time.Second
+	creditConcurrency = 12
 )
 
 // creditEntry 一条积分流水（面板表格一行）。
@@ -217,10 +218,11 @@ func (p *Panel) creditEntries(ctx context.Context) ([]creditEntry, bool) {
 	defer cancel()
 
 	var (
-		wg      sync.WaitGroup
-		mu      sync.Mutex
-		all     []creditEntry
-		partial bool
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		all      []creditEntry
+		failed   int
+		firstErr error
 	)
 	sem := make(chan struct{}, creditConcurrency)
 	for _, a := range p.pool.All() {
@@ -235,16 +237,25 @@ func (p *Panel) creditEntries(ctx context.Context) ([]creditEntry, bool) {
 				defer func() { <-sem }()
 			case <-budget.Done():
 				mu.Lock()
-				partial = true
+				failed++
+				if firstErr == nil {
+					firstErr = context.DeadlineExceeded
+				}
 				mu.Unlock()
 				return
 			}
 			callCtx, callCancel := context.WithTimeout(budget, creditCallTimeout)
 			defer callCancel()
-			obj, err := p.upstream.Points(callCtx, a.Session, 2)
+			// 只取 1 页：面板表最多展示 100 行，而第 2 页对流水很少的账号会报错
+			// （2026-10-23 实测：121 个号全部能取第 1 页，取 2 页时 partial 恒真）。
+			// 顺带把上游调用从 242 次降到 121 次。
+			obj, err := p.upstream.Records(callCtx, a.Session, 1)
 			if err != nil {
 				mu.Lock()
-				partial = true
+				failed++
+				if firstErr == nil {
+					firstErr = err
+				}
 				mu.Unlock()
 				return
 			}
@@ -277,6 +288,11 @@ func (p *Panel) creditEntries(ctx context.Context) ([]creditEntry, bool) {
 	wg.Wait()
 	sort.SliceStable(all, func(i, j int) bool { return all[i].TS > all[j].TS })
 
+	partial := failed > 0
+	if partial {
+		// 只记一行：日志页是排障入口，但这条不该把环刷满。
+		log.Printf("[panel] 积分流水：%d 个账号未取到（首个错误：%v）", failed, firstErr)
+	}
 	p.creditMu.Lock()
 	p.creditAll, p.creditAt, p.creditPart = all, time.Now(), partial
 	p.creditMu.Unlock()

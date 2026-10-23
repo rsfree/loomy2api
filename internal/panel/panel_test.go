@@ -901,9 +901,9 @@ func TestOverviewExposesDeadModels(t *testing.T) {
 	}
 }
 
-// TestCreditHistoryParallelAndCached 积分流水：8 个账号 × 2 页、每次上游 120ms。
-// 串行要 1.9s（线上 121 个账号更是一分钟以上，曾把日志页整页拖白），
-// 现在并发 8 + 60s 缓存：首访应在一秒内返回，二访不再打上游。
+// TestCreditHistoryParallelAndCached 积分流水：8 个账号 × 1 页、每次上游 120ms。
+// 串行要 0.96s（线上 121 个账号更是一分钟以上，曾把日志页整页拖白），
+// 现在并发 12 + 5 分钟缓存：首访应在一秒内返回，二访不再打上游。
 func TestCreditHistoryParallelAndCached(t *testing.T) {
 	var mu sync.Mutex
 	hits := 0
@@ -933,15 +933,15 @@ func TestCreditHistoryParallelAndCached(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("状态码 %d：%s", w.Code, w.Body.String())
 	}
-	if elapsed > 900*time.Millisecond {
-		t.Errorf("并发取数耗时 %v（串行约 1.9s，并发应 <900ms）", elapsed)
+	if elapsed > 600*time.Millisecond {
+		t.Errorf("并发取数耗时 %v（串行约 0.96s，并发应 <600ms）", elapsed)
 	}
 
 	mu.Lock()
 	first := hits
 	mu.Unlock()
-	if first != 16 {
-		t.Errorf("上游调用 %d 次，期望 8 账号 × 2 页 = 16", first)
+	if first != 8 {
+		t.Errorf("上游调用 %d 次，期望 8 账号 × 1 页 = 8", first)
 	}
 
 	start = time.Now()
