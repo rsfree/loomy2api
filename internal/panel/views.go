@@ -174,6 +174,115 @@ func (p *Panel) packagesHandler(w http.ResponseWriter, r *http.Request) {
 
 // creditHistoryHandler 把上游流水整理成时间轴账本（面板「积分历史」表）。
 // 与蓝本同构：time 取 RFC3339，debit 记负 delta，before/after 为变动前后余额。
+// 积分流水的取数参数。
+//
+// 每个账号 2 页流水 ⇒ 121 个账号 242 次上游调用。原先串行执行，实测 20s 还没
+// 返回（上游单次要 0.3~1s），而面板「运行日志」页把它和日志放在同一个
+// Promise.all 里 ⇒ 日志页永远空白。改为「并行 + 单次上限 + 总预算 + 60s 缓存」。
+const (
+	// 缓存 5 分钟：日志页每 5s 轮询一次，若缓存只有 1 分钟，等于每分钟把
+	// 121 个账号的流水全扫一遍（242 次上游调用），既慢又容易被上游限流。
+	creditCacheTTL    = 5 * time.Minute
+	creditFetchBudget = 20 * time.Second
+	creditCallTimeout = 6 * time.Second
+	creditConcurrency = 8
+)
+
+// creditEntry 一条积分流水（面板表格一行）。
+type creditEntry struct {
+	TS      int64
+	Account string
+	Delta   int64
+	Before  int64
+	After   int64
+	Desc    string
+	Model   string
+	Source  string
+}
+
+// creditEntries 取全部账号的积分流水（合并、按时间倒序），60s 内复用缓存。
+//
+// 第二个返回值 partial=true 表示有账号没取到（超时/上游报错）——调用方应把
+// 它透给前端，让「账本不全」这件事可见，而不是安静地少几行。
+func (p *Panel) creditEntries(ctx context.Context) ([]creditEntry, bool) {
+	p.creditMu.Lock()
+	if !p.creditAt.IsZero() && time.Since(p.creditAt) < creditCacheTTL {
+		all, part := p.creditAll, p.creditPart
+		p.creditMu.Unlock()
+		return all, part
+	}
+	p.creditMu.Unlock()
+
+	budget, cancel := context.WithTimeout(ctx, creditFetchBudget)
+	defer cancel()
+
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		all     []creditEntry
+		partial bool
+	)
+	sem := make(chan struct{}, creditConcurrency)
+	for _, a := range p.pool.All() {
+		if !a.Enabled || a.Paused || !a.SessionValid() {
+			continue
+		}
+		wg.Add(1)
+		go func(a *pool.Account) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-budget.Done():
+				mu.Lock()
+				partial = true
+				mu.Unlock()
+				return
+			}
+			callCtx, callCancel := context.WithTimeout(budget, creditCallTimeout)
+			defer callCancel()
+			obj, err := p.upstream.Points(callCtx, a.Session, 2)
+			if err != nil {
+				mu.Lock()
+				partial = true
+				mu.Unlock()
+				return
+			}
+			// upstream.Points 已把流水规范成 []map[string]any：time 是字符串秒、
+			// points 恒正数、direction 记借贷向、balance_after 数值。
+			recs, _ := obj["records"].([]map[string]any)
+			rows := make([]creditEntry, 0, len(recs))
+			for _, m := range recs {
+				delta := i64Any(m["points"])
+				if sAny(m["direction"]) == "debit" {
+					delta = -delta
+				}
+				after := i64Any(m["balance_after"])
+				rows = append(rows, creditEntry{
+					TS:      i64Any(sAny(m["time"])),
+					Account: a.Name,
+					Delta:   delta,
+					Before:  after - delta,
+					After:   after,
+					Desc:    sAny(m["desc"]),
+					Model:   sAny(m["model"]),
+					Source:  sAny(m["source"]),
+				})
+			}
+			mu.Lock()
+			all = append(all, rows...)
+			mu.Unlock()
+		}(a)
+	}
+	wg.Wait()
+	sort.SliceStable(all, func(i, j int) bool { return all[i].TS > all[j].TS })
+
+	p.creditMu.Lock()
+	p.creditAll, p.creditAt, p.creditPart = all, time.Now(), partial
+	p.creditMu.Unlock()
+	return all, partial
+}
+
 func (p *Panel) creditHistoryHandler(w http.ResponseWriter, r *http.Request) {
 	limit := 100
 	if v := r.URL.Query().Get("limit"); v != "" {
@@ -182,53 +291,17 @@ func (p *Panel) creditHistoryHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	uid := r.URL.Query().Get("uid")
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-	defer cancel()
 
-	type entry struct {
-		TS      int64
-		Account string
-		Delta   int64
-		Before  int64
-		After   int64
-		Desc    string
-		Model   string
-		Source  string
-	}
-	var all []entry
-	for _, a := range p.pool.All() {
-		if uid != "" && a.Name != uid {
-			continue
-		}
-		if !a.Enabled || a.Paused || !a.SessionValid() {
-			continue
-		}
-		obj, err := p.upstream.Points(ctx, a.Session, 2)
-		if err != nil {
-			continue
-		}
-		// upstream.Points 已把流水规范成 []map[string]any：time 是字符串秒、
-		// points 恒正数、direction 记借贷向、balance_after 数值。
-		recs, _ := obj["records"].([]map[string]any)
-		for _, m := range recs {
-			delta := i64Any(m["points"])
-			if sAny(m["direction"]) == "debit" {
-				delta = -delta
+	all, partial := p.creditEntries(r.Context())
+	if uid != "" {
+		kept := make([]creditEntry, 0, len(all))
+		for _, e := range all {
+			if e.Account == uid {
+				kept = append(kept, e)
 			}
-			after := i64Any(m["balance_after"])
-			all = append(all, entry{
-				TS:      i64Any(sAny(m["time"])),
-				Account: a.Name,
-				Delta:   delta,
-				Before:  after - delta,
-				After:   after,
-				Desc:    sAny(m["desc"]),
-				Model:   sAny(m["model"]),
-				Source:  sAny(m["source"]),
-			})
 		}
+		all = kept
 	}
-	sort.SliceStable(all, func(i, j int) bool { return all[i].TS > all[j].TS })
 	if len(all) > limit {
 		all = all[:limit]
 	}
@@ -244,7 +317,9 @@ func (p *Panel) creditHistoryHandler(w http.ResponseWriter, r *http.Request) {
 			"model": e.Model, "source": e.Source,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"entries": entries, "limit": limit})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"entries": entries, "limit": limit, "partial": partial,
+	})
 }
 
 func sAny(v any) string {

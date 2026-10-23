@@ -1017,7 +1017,18 @@ function logLevel(text) {
   return '';
 }
 
-async function loadLogs() {
+// loadCreditHistory 单独拉积分账本（带 25s 上限）：慢接口不阻塞日志渲染。
+function loadCreditHistory() {
+  const opts = (typeof AbortSignal !== 'undefined' && AbortSignal.timeout)
+    ? { signal: AbortSignal.timeout(25000) } : {};
+  api('credit_history?limit=' + creditLimitValue(), opts)
+    .then(renderCreditHistory)
+    .catch(() => {});
+}
+
+// loadLogs 拉日志视图。withCredit=false 时不拉积分账本（轮询用：账本 5 分钟
+// 缓存一次足够，没必要跟着 5s 轮询刷）。
+async function loadLogs(withCredit) {
   const box = $('logBox');
   const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
   const limit = $('reqLimit').value || 100;
@@ -1026,11 +1037,10 @@ async function loadLogs() {
   const rq = trangeQuery('reqRange', false);
   rq.set('limit', limit);
   try {
-    const [d, requestRows, errSum, credit] = await Promise.all([
+    const [d, requestRows, errSum] = await Promise.all([
       api('logs'),
       api('requests?' + rq.toString()).catch(() => ({ records: [] })),
       api('error_summary').catch(() => null),
-      api('credit_history?limit=' + creditLimitValue()).catch(() => null),
     ]);
     renderRequests(requestRows.records || []);
     const entries = (d.entries || []).filter(e => logCh === 'all' || e.ch === logCh);
@@ -1049,7 +1059,9 @@ async function loadLogs() {
       ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
       : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + entries.length + ' 行';
     renderErrorSummary(errSum);
-    renderCreditHistory(credit);
+    // 积分历史要逐账号打上游（121 个号 = 200+ 次调用），单独异步拉：
+    // 它慢不该把日志一起拖白（2026-10-23 线上事故：日志页永远「暂无日志」）。
+    if (withCredit !== false) loadCreditHistory();
   } catch (e) { /* 概览已提示 */ }
 }
 
@@ -1518,7 +1530,7 @@ applyFolds();
 /* ── 轮询 ─────────────────────────────────────────────────────────── */
 function refreshVisible() {
   if (view === 'accounts') loadOverview(true);
-  else if (view === 'logs') loadLogs();
+  else if (view === 'logs') loadLogs(false);
 }
 function start() {
   loadOverview(true).catch(() => {});

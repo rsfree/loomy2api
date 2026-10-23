@@ -52,6 +52,14 @@ type Panel struct {
 	renewMu    sync.Mutex
 	renewTried map[string]time.Time
 
+	// 积分流水缓存。121 个账号 × 2 页流水 = 242 次上游调用，串行要一分钟以上；
+	// 面板「运行日志」页把它和日志放进同一个 Promise.all，慢一次整页就是空白
+	// （2026-10-23 线上事故：日志页永远「暂无日志」）。现在并行取 + 缓存 60s。
+	creditMu   sync.Mutex
+	creditAt   time.Time
+	creditAll  []creditEntry
+	creditPart bool
+
 	started time.Time
 }
 

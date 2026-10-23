@@ -2,6 +2,7 @@ package panel
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -896,5 +898,86 @@ func TestOverviewExposesDeadModels(t *testing.T) {
 	}
 	if !strings.Contains(body, "prefer_daily_quota") {
 		t.Errorf("overview 应带 prefer_daily_quota：%s", body)
+	}
+}
+
+// TestCreditHistoryParallelAndCached 积分流水：8 个账号 × 2 页、每次上游 120ms。
+// 串行要 1.9s（线上 121 个账号更是一分钟以上，曾把日志页整页拖白），
+// 现在并发 8 + 60s 缓存：首访应在一秒内返回，二访不再打上游。
+func TestCreditHistoryParallelAndCached(t *testing.T) {
+	var mu sync.Mutex
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		time.Sleep(120 * time.Millisecond)
+		_, _ = io.WriteString(w, `{"code":"000000","data":{"list":[]}}`)
+	}))
+	defer srv.Close()
+
+	pl, p := newTestPanelUpstream(t, srv.URL)
+	expire := time.Now().Add(24 * time.Hour).Unix()
+	for i := 2; i <= 8; i++ {
+		bal := int64(100)
+		p.Add(&pool.Account{
+			Name: fmt.Sprintf("acc%d", i), LoginID: fmt.Sprintf("1380000000%d", i),
+			Enabled: true, Session: fmt.Sprintf("sess-%d", i), ExpireAt: expire, Available: &bal,
+		})
+	}
+
+	start := time.Now()
+	w := httptest.NewRecorder()
+	pl.creditHistoryHandler(w, httptest.NewRequest(http.MethodGet, "/panel/api/credit_history?limit=10", nil))
+	elapsed := time.Since(start)
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 %d：%s", w.Code, w.Body.String())
+	}
+	if elapsed > 900*time.Millisecond {
+		t.Errorf("并发取数耗时 %v（串行约 1.9s，并发应 <900ms）", elapsed)
+	}
+
+	mu.Lock()
+	first := hits
+	mu.Unlock()
+	if first != 16 {
+		t.Errorf("上游调用 %d 次，期望 8 账号 × 2 页 = 16", first)
+	}
+
+	start = time.Now()
+	w2 := httptest.NewRecorder()
+	pl.creditHistoryHandler(w2, httptest.NewRequest(http.MethodGet, "/panel/api/credit_history?limit=10", nil))
+	if d := time.Since(start); d > 100*time.Millisecond {
+		t.Errorf("缓存命中应 <100ms，实际 %v", d)
+	}
+	mu.Lock()
+	second := hits
+	mu.Unlock()
+	if second != first {
+		t.Errorf("60s 内重复请求又打了 %d 次上游", second-first)
+	}
+}
+
+// TestCreditHistoryMarksPartial 有账号取不到流水时仍返回 200，但带 partial=true，
+// 让「账本不全」可见而不是安静少几行。
+func TestCreditHistoryMarksPartial(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":"boom"}`)
+	}))
+	defer srv.Close()
+
+	pl, _ := newTestPanelUpstream(t, srv.URL)
+	w := httptest.NewRecorder()
+	pl.creditHistoryHandler(w, httptest.NewRequest(http.MethodGet, "/panel/api/credit_history?limit=10", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 %d：%s", w.Code, w.Body.String())
+	}
+	var out map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("响应不是 JSON：%v", err)
+	}
+	if out["partial"] != true {
+		t.Errorf("上游全失败时应标 partial=true，实际 %v", out["partial"])
 	}
 }
