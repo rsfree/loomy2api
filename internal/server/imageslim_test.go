@@ -317,3 +317,37 @@ func TestShrinkImageRetryStopsAtDeadline(t *testing.T) {
 		t.Errorf("原始错误体丢了：%q", body)
 	}
 }
+
+// TestImageSlow400SkipsSlim 排队型 400（耗时超过阈值）不再做字段精简：
+// 真正的字段错误秒回，慢 400 是上游队列的通用报错，再减字段只会白等一轮。
+func TestImageSlow400SkipsSlim(t *testing.T) {
+	var calls int
+	fs := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			_, _ = io.WriteString(w, `{"object":"list","data":[
+				{"id":"doubao-seedream-5-lite","name":"5 lite","type":"image"}]}`)
+			return
+		}
+		calls++
+		time.Sleep(120 * time.Millisecond)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"message":"请求有误，请重试","type":"invalid_request_error","code":400}}`)
+	})
+	h, _, _ := newTestHandler(t, fs.srv.URL, nil)
+	_ = h.Models.Get(context.Background(), "sess")
+	old := imageSlow400Threshold
+	imageSlow400Threshold = 50 * time.Millisecond
+	defer func() { imageSlow400Threshold = old }()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"doubao-seedream-5-lite","prompt":"猫","seed":7,"watermark":true}`))
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("状态码 %d，期望 400：%s", w.Code, w.Body.String())
+	}
+	if calls != 1 {
+		t.Errorf("排队型 400 仍做了精简：上游调用 %d 次", calls)
+	}
+}

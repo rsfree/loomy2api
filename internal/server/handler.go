@@ -1044,6 +1044,7 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 			if kind == "image" {
 				ctx, cancel = context.WithTimeout(ctx, imageAttemptCap)
 			}
+			attemptStart := time.Now()
 			resp, err := h.Upstream.Do(ctx, http.MethodPost, suffix, acc.Session, payload, nil)
 			cancel()
 			if err != nil {
@@ -1063,9 +1064,16 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 			// 生图 400 多为客户端带了下游 provider 不认的扩展字段（见 imageslim.go）：
 			// 第一次先按白名单减肥重试，避免把「请求有误」直接抛给用户。
 			if resp.Status == http.StatusBadRequest && kind == "image" {
+				// 字段型 400 秒回，精简有意义；排队 60s 以上才回的通用 400 是
+				// 上游拥堵的另一种表现，再减字段只会白等一轮（实测每轮 300s）。
 				// 去掉哪些字段已由 shrinkImageRetry 打日志；这里不再额外写请求行，
 				// 否则一次请求会同时出现「已精简」和「200 points=…」两行。
-				resp, payload, _ = h.shrinkImageRetry(r.Context(), suffix, acc.Session, payload, resp, deadline)
+				if time.Since(attemptStart) > imageSlow400Threshold {
+					log.Printf("[image] 上游 400 耗时 %.0fs，判为排队型错误，跳过精简重试",
+						time.Since(attemptStart).Seconds())
+				} else {
+					resp, payload, _ = h.shrinkImageRetry(r.Context(), suffix, acc.Session, payload, resp, deadline)
+				}
 			}
 			out := resp.BodyText()
 			h.Pool.Release(acc)

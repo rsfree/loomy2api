@@ -37,6 +37,11 @@ import (
 // 这里限制的是「单张解码后」的大小，避免一个坏请求把内存打满。
 const maxImagePart = 20 << 20
 
+// imageSlow400Threshold 判「排队型 400」的阈值：真正的字段错误（seed/watermark
+// 不认）上游秒回；排队到一分钟后才回的通用 400 再怎么减字段也一样，直接放弃精简。
+// 用 var 而不是 const：测试要把它调小才能覆盖这个分支。
+var imageSlow400Threshold = 60 * time.Second
+
 // imageAttemptCap 单次上游生图调用的硬上限。实测成功请求的 p99 ≈ 869s，
 // 取 900s 兜住长尾；它只管「这一次调用最多等多久」，不参与「还要不要换号」
 // 的预算（那个由 image_deadline_seconds 控制）。
