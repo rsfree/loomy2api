@@ -786,7 +786,8 @@ func (p *Panel) doLogin(acc *pool.Account) error {
 	if acc.Identity.DevID == "" {
 		acc.Identity = account.NewIdentity()
 	}
-	res, err := p.accounts.LoginByPassword(acc.LoginID, acc.Password, acc.Identity)
+	// 用账号名（而不是 loginid）作为出口身份：出口分配按账号名算，两边必须一致。
+	res, err := p.accounts.LoginByPasswordAs(acc.Name, acc.LoginID, acc.Password, acc.Identity)
 	if err != nil {
 		return err
 	}

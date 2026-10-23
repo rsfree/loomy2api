@@ -451,12 +451,13 @@ function accRowHtml(s, now, maxCred) {
   const usageTitle = '累计：' + req + ' 次 / ' + fmtTok(tu.total_tokens) + ' tok / 均延迟 ' + latency +
     (rate === '—' ? '' : ' / ' + rate);
   const days = (s.session_days_left == null) ? '—' : s.session_days_left.toFixed(1) + 'd';
-  return '<tr class="' + st.cls + '" title="' + esc('账号 ' + s.name + (s.userid ? '\nuserid: ' + s.userid : '')) + '">' +
+  // 出口 IP 放 title 而不是行内文字：账号列宽度固定，行内会被省略号吃掉（实测截断）。
+  const egressTip = s.egress ? '\n出口: ' + s.egress : '';
+  return '<tr class="' + st.cls + '" title="' + esc('账号 ' + s.name + (s.userid ? '\nuserid: ' + s.userid : '') + egressTip) + '">' +
     '<td class="mark" aria-hidden="true"><i></i></td>' +
     '<td class="who"><div class="nm">' + remarkName(s.name, esc(s.name || '未命名')) + '</div>' +
     '<div class="id">' + esc(s.loginid || (s.userid ? 'uid ' + s.userid : '—')) +
-    (s.session_days_left == null ? '' : ' · 登录态 ' + days) +
-    (s.egress ? ' · 出口 ' + esc(s.egress) : '') + '</div></td>' +
+    (s.session_days_left == null ? '' : ' · 登录态 ' + days) + '</div></td>' +
     '<td>' + st.tag + err + locks + '</td>' +
     '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + fmtPoints(avail) +
     (s.permanent != null && s.daily_balance != null

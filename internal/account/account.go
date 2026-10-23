@@ -229,10 +229,19 @@ type LoginResult struct {
 
 // LoginByPassword 手机号 + 密码登录（全自动，无需验证码）。
 func (c *Client) LoginByPassword(loginID, password string, ident Identity) (*LoginResult, error) {
+	return c.LoginByPasswordAs(loginID, loginID, password, ident)
+}
+
+// LoginByPasswordAs 同 LoginByPassword，但显式指定**出口身份**（账号名）。
+//
+// 账号名与 loginid 不一定相同（导入的卡密常有独立备注名），而出口分配是按账号名
+// 算的：这里若用 loginid，登录会落到另一个 IP，与后续生成流量不一致——风控看到
+// 的就是「同一个号刚换了网络」。
+func (c *Client) LoginByPasswordAs(name, loginID, password string, ident Identity) (*LoginResult, error) {
 	ident = ident.orDefault()
 	// getPuKey 在同一出口取：公钥与登录请求若来自不同 IP，风控看到的是
 	// 一次「刚换过网络」的登录，等于自找验证码。
-	pkOut, err := c.callAs(loginID, "/login/account/getPuKey", c.envelope(ident, nil))
+	pkOut, err := c.callAs(name, "/login/account/getPuKey", c.envelope(ident, nil))
 	if err != nil {
 		return nil, err
 	}
@@ -245,7 +254,7 @@ func (c *Client) LoginByPassword(loginID, password string, ident Identity) (*Log
 	if err != nil {
 		return nil, err
 	}
-	out, err := c.callAs(loginID, "/login/account/byPwd", c.envelope(ident, map[string]any{
+	out, err := c.callAs(name, "/login/account/byPwd", c.envelope(ident, map[string]any{
 		"loginid":  loginID,
 		"password": enc,
 		"rcode":    rcode,
