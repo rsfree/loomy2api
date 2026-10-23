@@ -31,9 +31,13 @@ type Record struct {
 	LatencyMs  int64  `json:"latency_ms"`
 	TTFBMs     int64  `json:"ttfb_ms,omitempty"`
 	ClientIP   string `json:"ip,omitempty"`
-	UserAgent  string `json:"ua,omitempty"`
-	RequestID  string `json:"rid,omitempty"`
-	Error      string `json:"error,omitempty"`
+	// Egress 本次请求**实际走出去**的本机源 IP（出口隔离的落地证据）。
+	// 与 ClientIP 是相反方向：ClientIP 是谁调进来，Egress 是从哪个出口出去。
+	// "direct" = 已启用出口隔离但这次请求没绑定账号（未知 session 回落默认出口）。
+	Egress    string `json:"egress,omitempty"`
+	UserAgent string `json:"ua,omitempty"`
+	RequestID string `json:"rid,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 // Ledger 请求台账。
@@ -295,6 +299,10 @@ type RecordFilter struct {
 	Result  string // ok | fail | ""
 	Model   string
 	Account string
+	// ClientIP / Egress 按子串匹配（大小写不敏感），与 Keyword 同口径：
+	// 支持 "154.40.45." 这类前缀写法，排查「某个出口上的全部请求」很方便。
+	ClientIP string
+	Egress   string
 }
 
 // Match 是否命中筛选。
@@ -321,9 +329,15 @@ func (f RecordFilter) Match(r Record) bool {
 	if f.Account != "" && r.Account != f.Account {
 		return false
 	}
+	if f.ClientIP != "" && !strings.Contains(strings.ToLower(r.ClientIP), strings.ToLower(f.ClientIP)) {
+		return false
+	}
+	if f.Egress != "" && !strings.Contains(strings.ToLower(r.Egress), strings.ToLower(f.Egress)) {
+		return false
+	}
 	if f.Keyword != "" {
 		hay := strings.ToLower(strings.Join([]string{
-			r.Model, r.Account, r.RequestID, r.ClientIP, r.UserAgent, r.Error,
+			r.Model, r.Account, r.RequestID, r.ClientIP, r.Egress, r.UserAgent, r.Error,
 			fmt.Sprintf("%d", r.Status),
 		}, " "))
 		for _, word := range strings.Fields(strings.ToLower(f.Keyword)) {

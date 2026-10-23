@@ -1085,7 +1085,7 @@ function reqMatch(e, f) {
   if (f.outcome === 'ok' && !ok) return false;
   if (f.outcome === 'fail' && ok) return false;
   if (f.q) {
-    const text = [e && e.ip, e && e.ua, e && e.model, e && e.account, e && e.rid, e && e.error]
+    const text = [e && e.ip, e && e.egress, e && e.ua, e && e.model, e && e.account, e && e.rid, e && e.error]
       .filter(Boolean).join(' ').toLowerCase();
     for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
       if (!text.includes(kw)) return false;
@@ -1104,7 +1104,8 @@ function requestLogText(e) {
   const ok = Number(e && e.status || 0) >= 200 && Number(e && e.status || 0) < 300;
   const tok = Number(e && e.prompt || 0) + Number(e && e.completion || 0);
   return [when, (e && e.status || '—') + (ok ? ' 成功' : ' 失败'), e && e.model || '—', e && e.account || '—',
-    e && e.ip || '—', e && e.ua || '—', fmtMs(e && e.latency_ms), fmtTok(tok) + ' tok',
+    '来源 ' + (e && e.ip || '—') + ' → 出口 ' + (e && e.egress || '—'), e && e.ua || '—',
+    fmtMs(e && e.latency_ms), fmtTok(tok) + ' tok',
     e && e.points ? fmtPoints(e.points) + ' 积分' : '', e && e.ttfb_ms ? 'TTFB ' + fmtMs(e.ttfb_ms) : '',
     e && e.rid || '—'].filter(Boolean).join(' | ');
 }
@@ -1114,6 +1115,7 @@ function renderRequestTable() {
   tb.innerHTML = list.map(e => {
     const when = e && e.t ? new Date(e.t * 1000).toLocaleString('zh-CN', { hour12: false }) : '—';
     const ip = e && e.ip ? e.ip : '';
+    const eg = e && e.egress ? e.egress : '';
     const ua = e && e.ua ? e.ua : '';
     const rid = e && e.rid ? e.rid : '';
     return '<tr title="' + esc(requestLogText(e)) + '">' +
@@ -1121,7 +1123,12 @@ function renderRequestTable() {
       '<td>' + reqOutcomeTag(e) + '</td>' +
       '<td>' + esc(e && e.model || '—') + '</td>' +
       '<td>' + esc(e && e.account || '—') + '</td>' +
-      '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+      // 来源在上、出口在下：两个方向相反的 IP 堆成一列两行，比并排两列好读。
+      '<td><div class="src2">' +
+      (ip ? '<span class="from" title="来源 ' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="from muted">—</span>') +
+      (eg ? '<span class="via" title="出口 ' + esc(eg) + '">↳ ' + esc(eg) + '</span>'
+        : '<span class="via" title="未记录出口（egress.mode=direct 或旧版本台账）">↳ —</span>') +
+      '</div></td>' +
       '<td>' + (ua ? '<span class="clip" title="' + esc(ua) + '">' + esc(ua) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '<td class="num">' + fmtMs(e && e.latency_ms) + '</td>' +
       '<td class="num">' + fmtTok(Number(e && e.prompt || 0) + Number(e && e.completion || 0)) + '</td>' +
@@ -1133,10 +1140,11 @@ function renderRequestTable() {
 
   const filtered = list.length !== reqEntries.length;
   const hasSource = reqEntries.some(e => e && (e.ip || e.ua));
+  const hasEgress = reqEntries.some(e => e && e.egress);
   $('reqCount').textContent = !reqEntries.length ? ''
     : (filtered ? '命中 ' + list.length + ' / ' + reqEntries.length + ' 条' : reqEntries.length + ' 条') +
-      (hasSource ? '' : ' · 来源未记录');
-  $('reqCount').className = (filtered || !hasSource) ? 'note src-off' : 'note';
+      (hasSource ? '' : ' · 来源未记录') + (hasEgress ? '' : ' · 出口未记录');
+  $('reqCount').className = (filtered || !hasSource || !hasEgress) ? 'note src-off' : 'note';
 }
 function renderRequests(records) {
   reqEntries = records || [];

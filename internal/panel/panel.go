@@ -307,6 +307,10 @@ func (p *Panel) requests(w http.ResponseWriter, r *http.Request) {
 		Result:  q.Get("result"),
 		Model:   q.Get("model"),
 		Account: q.Get("account"),
+		// 来源 / 出口两个方向都能筛：排查「某个出口上的请求全挂了」时
+		// ?egress=154.40.45.167 比翻日志快。
+		ClientIP: q.Get("client_ip"),
+		Egress:   q.Get("egress"),
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"records": p.ledger.Recent(limit, filter)})
 }
@@ -426,7 +430,7 @@ func (p *Panel) addAccount(w http.ResponseWriter, r *http.Request) {
 	// 有手机号 + 密码就立刻登录一次，验证凭证并拿 session。
 	if body.Login && body.LoginID != "" && body.Password != "" {
 		if err := p.doLogin(acc); err != nil {
-			p.Logf("账号 %s 加入，但登录失败：%v", acc.Name, err)
+			p.Logf("账号 %s 加入，但登录失败%s：%v", acc.Name, p.egressTag(acc.Name), err)
 			p.persist(acc)
 			writeErr(w, http.StatusBadGateway, "账号已加入，但登录失败: "+err.Error())
 			return
@@ -453,7 +457,7 @@ func (p *Panel) loginAccount(w http.ResponseWriter, r *http.Request) {
 
 	if err := p.doLogin(acc); err != nil {
 		acc.SetLastError("登录失败: " + err.Error())
-		p.Logf("账号 %s 登录失败：%v", name, err)
+		p.Logf("账号 %s 登录失败%s：%v", name, p.egressTag(name), err)
 		p.persist(acc)
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -814,7 +818,7 @@ func (p *Panel) refreshQuota(acc *pool.Account) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := p.refreshQuotaCtx(ctx, acc); err != nil {
-		p.Logf("账号 %s 额度刷新失败：%v", acc.Name, err)
+		p.Logf("账号 %s 额度刷新失败%s：%v", acc.Name, p.egressTag(acc.Name), err)
 		return
 	}
 	p.persist(acc)
@@ -826,13 +830,13 @@ func (p *Panel) checkinAndRefresh(acc *pool.Account) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if _, err := p.doCheckinCtx(ctx, acc); err != nil {
-		p.Logf("账号 %s 登录后签到失败：%v", acc.Name, err)
+		p.Logf("账号 %s 登录后签到失败%s：%v", acc.Name, p.egressTag(acc.Name), err)
 	} else {
 		p.persist(acc)
 	}
 	// 签到成功时 SetQuota 已写入 first-login 口径；这里补 records 侧余额。
 	if err := p.refreshQuotaCtx(ctx, acc); err != nil {
-		p.Logf("账号 %s 额度刷新失败：%v", acc.Name, err)
+		p.Logf("账号 %s 额度刷新失败%s：%v", acc.Name, p.egressTag(acc.Name), err)
 		return
 	}
 	p.persist(acc)
@@ -848,6 +852,25 @@ func (p *Panel) refreshQuotaCtx(ctx context.Context, acc *pool.Account) error {
 	}
 	acc.SetQuota(balance)
 	return nil
+}
+
+// egressOf 该账号的出口 IP（未启用出口隔离时为空）。
+//
+// 运维日志里带上它：同一条「连不上上游 / 超时」的报错，可能只在某个出口上复现，
+// 不写出来就只能靠猜（2026-10-23 的 .34 被讯飞丢包就是这样查了一轮）。
+func (p *Panel) egressOf(name string) string {
+	if p.egress == nil || !p.egress.Enabled() {
+		return ""
+	}
+	return p.egress.IPString(name)
+}
+
+// egressTag 日志行尾的出口标记（未启用时为空串，保持旧行格式）。
+func (p *Panel) egressTag(name string) string {
+	if e := p.egressOf(name); e != "" {
+		return "（出口 " + e + "）"
+	}
+	return ""
 }
 
 func (p *Panel) persist(acc *pool.Account) {

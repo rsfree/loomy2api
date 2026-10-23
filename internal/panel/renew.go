@@ -76,8 +76,8 @@ func (p *Panel) AutoRenew(now time.Time) (renewed, failed int) {
 		err := p.doLogin(a)
 		if err != nil {
 			a.SetLastError("自动重登失败: " + err.Error())
-			p.Logf("账号 %s 自动重登失败（剩余 %.1f 天）：%v；%s 后重试",
-				a.Name, left, err, renewRetry)
+			p.Logf("账号 %s 自动重登失败（剩余 %.1f 天）%s：%v；%s 后重试",
+				a.Name, left, p.egressTag(a.Name), err, renewRetry)
 			failed++
 		} else {
 			a.Enabled = true

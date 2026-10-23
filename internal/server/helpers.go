@@ -122,6 +122,35 @@ func clientIP(r *http.Request) string {
 
 func ua(r *http.Request) string { return truncate(r.Header.Get("User-Agent"), 200) }
 
+// uaEngines 只说明渲染引擎、不说明「是什么客户端」的通用 token：浏览器 UA
+// 恒定包含它们，拿它当客户端标签等于没信息。
+var uaEngines = map[string]bool{
+	"mozilla": true, "applewebkit": true, "gecko": true, "khtml": true,
+	"like": true, "safari": true, "compatible": true, "msie": true, "trident": true,
+}
+
+// shortUA 从 User-Agent 提取便于人眼识别的客户端标签（"curl/8.4.0"、
+// "OpenAI/Python"、"Go-http-client"）。
+//
+// 对齐 workbuddy2api 的 logfmt.ShortUA：完整 UA 动辄 150+ 字符（浏览器尤其），
+// 直接铺进日志行会把其它列挤掉；日志里只留「是什么客户端」，完整 UA 仍存台账
+// 供面板悬停查看。没有 name/version 形态时回落整串前 40 字节。
+func shortUA(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	for _, tok := range strings.Fields(s) {
+		tok = strings.Trim(tok, "(),;")
+		name, _, ok := strings.Cut(tok, "/")
+		if !ok || name == "" || uaEngines[strings.ToLower(name)] {
+			continue
+		}
+		return truncate(tok, 40)
+	}
+	return truncate(s, 40)
+}
+
 func rid(h http.Header) string {
 	for _, k := range []string{"X-Request-Id", "X-Request-ID", "Traceparent"} {
 		if v := h.Get(k); v != "" {

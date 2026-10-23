@@ -390,7 +390,7 @@ func (h *Handler) chatOnce(w http.ResponseWriter, r *http.Request, req map[strin
 			h.Pool.Release(acc)
 			h.Pool.ReportFailure(acc, 0, err.Error(), skey, model)
 			lastStatus, lastBody = http.StatusBadGateway, err.Error()
-			h.logCall(acc, model, 0, time.Since(started), "sync 连接异常: "+err.Error(), h.requestIP(r))
+			h.logCall(acc, model, 0, time.Since(started), "sync 连接异常: "+err.Error(), r)
 			continue
 		}
 		body := resp.BodyText()
@@ -414,9 +414,9 @@ func (h *Handler) chatOnce(w http.ResponseWriter, r *http.Request, req map[strin
 				Account: acc.Name, Model: model, Kind: "chat", Status: 200,
 				Prompt: prompt, Completion: completion, Reasoning: reasoning,
 				Points: pts, LatencyMs: time.Since(started).Milliseconds(),
-				ClientIP: clientIP(r), UserAgent: ua(r), RequestID: rid(resp.Header),
-			})
-			h.logCall(acc, model, 200, time.Since(started), usageSummary(prompt, completion, pts, reasoning), h.requestIP(r))
+				RequestID: rid(resp.Header),
+			}, r, acc)
+			h.logCall(acc, model, 200, time.Since(started), usageSummary(prompt, completion, pts, reasoning), r)
 			w.Header().Set("X-Loomy-Account", acc.Name)
 			if id := rid(resp.Header); id != "" {
 				w.Header().Set("X-Request-Id", id)
@@ -431,7 +431,7 @@ func (h *Handler) chatOnce(w http.ResponseWriter, r *http.Request, req map[strin
 		lastStatus, lastBody = resp.Status, body
 		fault := pool.Classify(resp.Status, body)
 		h.Pool.ReportFailure(acc, resp.Status, body, skey, model)
-		h.logCall(acc, model, resp.Status, time.Since(started), "上游返回，换号重试", h.requestIP(r))
+		h.logCall(acc, model, resp.Status, time.Since(started), "上游返回，换号重试", r)
 		if pool.FatalRequest(fault) {
 			break
 		}
@@ -486,7 +486,7 @@ func (h *Handler) chatAggregated(w http.ResponseWriter, r *http.Request, req map
 		close(done)
 	}()
 
-	obj, err := h.collectStream(r.Context(), sreq, model, skey, extra)
+	obj, err := h.collectStream(r.Context(), r, sreq, model, skey, extra)
 	if err != nil {
 		h.noteFail(r, "chat", model, nil, http.StatusBadGateway, err.Error(), started)
 		writeJSON(w, map[string]any{"error": map[string]any{
@@ -494,7 +494,7 @@ func (h *Handler) chatAggregated(w http.ResponseWriter, r *http.Request, req map
 		}})
 		return
 	}
-	h.logCall(nil, model, 200, time.Since(started), "流式聚合（长任务）", h.requestIP(r))
+	h.logCall(nil, model, 200, time.Since(started), "流式聚合（长任务）", r)
 	buf, _ := json.Marshal(obj)
 	_, _ = w.Write(buf)
 }
@@ -504,7 +504,7 @@ func (h *Handler) chatAggregated(w http.ResponseWriter, r *http.Request, req map
 // 内部强制 stream=true：调用方（/v1/messages、/v1/responses、长任务）传进来的
 // 请求体可能是 stream:false，而这里按 SSE 解析响应——不覆盖的话上游返回普通 JSON，
 // 解析器读到 0 帧，客户端会拿到一个空回答。
-func (h *Handler) collectStream(ctx context.Context, req map[string]any, model, skey string, extra map[string]string) (map[string]any, error) {
+func (h *Handler) collectStream(ctx context.Context, r *http.Request, req map[string]any, model, skey string, extra map[string]string) (map[string]any, error) {
 	upReq := cloneMap(req)
 	upReq["stream"] = true
 
@@ -560,7 +560,7 @@ func (h *Handler) collectStream(ctx context.Context, req map[string]any, model, 
 			Account: acc.Name, Model: model, Kind: "chat", Stream: false, Status: 200,
 			Prompt: prompt, Completion: completion, Reasoning: reasoning, Points: pts,
 			LatencyMs: time.Since(started).Milliseconds(),
-		})
+		}, r, acc)
 		return out, nil
 	}
 	if lastErr == nil {
@@ -671,9 +671,8 @@ func (h *Handler) chatStream(w http.ResponseWriter, r *http.Request, req map[str
 		Account: lastAcc.Name, Model: model, Kind: "chat", Stream: true, Status: 200,
 		Prompt: prompt, Completion: completion, Reasoning: reasoning, Points: pts,
 		LatencyMs: elapsed.Milliseconds(), TTFBMs: ttfb,
-		ClientIP: clientIP(r), UserAgent: ua(r),
-	})
-	h.logStream(lastAcc, model, elapsed, ttfb, completion, reasoning, pts, h.requestIP(r))
+	}, r, lastAcc)
+	h.logStream(lastAcc, model, elapsed, ttfb, completion, reasoning, pts, r)
 }
 
 // responses POST /v1/responses（Codex Responses API → chat completions）。
@@ -709,7 +708,7 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		h.responsesStream(w, r, chatReq, model, skey, extra)
 		return
 	}
-	obj, err := h.collectStream(r.Context(), chatReq, model, skey, extra)
+	obj, err := h.collectStream(r.Context(), r, chatReq, model, skey, extra)
 	if err != nil {
 		h.fail(w, r, "responses", model, nil, http.StatusBadGateway, err.Error(), started)
 		return
@@ -809,9 +808,8 @@ func (h *Handler) responsesStream(w http.ResponseWriter, r *http.Request, chatRe
 		Account: acc.Name, Model: model, Kind: "responses", Stream: true, Status: 200,
 		Prompt: prompt, Completion: completion, Reasoning: reasoning, Points: pts,
 		LatencyMs: time.Since(started).Milliseconds(),
-		ClientIP:  clientIP(r), UserAgent: ua(r),
-	})
-	h.logStream(acc, model, time.Since(started), 0, completion, reasoning, pts, h.requestIP(r))
+	}, r, acc)
+	h.logStream(acc, model, time.Since(started), 0, completion, reasoning, pts, r)
 }
 
 // anthropicMessages POST /v1/messages。
@@ -851,7 +849,7 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		h.anthropicStream(w, r, chatReq, model, skey, extra)
 		return
 	}
-	obj, err := h.collectStream(r.Context(), chatReq, model, skey, extra)
+	obj, err := h.collectStream(r.Context(), r, chatReq, model, skey, extra)
 	if err != nil {
 		h.noteFail(r, "messages", model, nil, http.StatusBadGateway, err.Error(), started)
 		writeAnthropicErr(w, http.StatusBadGateway, err.Error())
@@ -955,8 +953,7 @@ func (h *Handler) anthropicStream(w http.ResponseWriter, r *http.Request, chatRe
 		Account: acc.Name, Model: model, Kind: "messages", Stream: true, Status: 200,
 		Prompt: prompt, Completion: completion, Reasoning: reasoning, Points: pts,
 		LatencyMs: time.Since(started).Milliseconds(),
-		ClientIP:  clientIP(r), UserAgent: ua(r),
-	})
+	}, r, acc)
 }
 
 // passthrough 图片 / 向量等固定上游端点。
@@ -1056,7 +1053,7 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 				if errors.Is(err, context.DeadlineExceeded) {
 					lastStatus = http.StatusGatewayTimeout
 					lastBody = `{"error":{"message":"单次生图超过 900s 仍无响应，请稍后重试","type":"timeout_error","param":null,"code":504}}`
-					h.logCall(acc, model, http.StatusGatewayTimeout, time.Since(started), "单次尝试超时", h.requestIP(r))
+					h.logCall(acc, model, http.StatusGatewayTimeout, time.Since(started), "单次尝试超时", r)
 					log.Printf("[image] 单次尝试超过 %s，放弃请求（已耗时 %.0fs）", imageAttemptCap, time.Since(started).Seconds())
 					break
 				}
@@ -1097,12 +1094,11 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 					Account: acc.Name, Model: model, Kind: kind, Status: 200,
 					Prompt: prompt, Completion: completion, Reasoning: reasoning, Points: pts,
 					LatencyMs: time.Since(started).Milliseconds(),
-					ClientIP:  clientIP(r), UserAgent: ua(r),
-				})
+				}, r, acc)
 				// passthrough（生图/embeddings/search）也要进「运行日志」：
 				// 否则面板看不到这些请求，更没法核对来源 IP / 代理是否生效。
 				h.logCall(acc, model, 200, time.Since(started),
-					usageSummary(prompt, completion, pts, reasoning), h.requestIP(r))
+					usageSummary(prompt, completion, pts, reasoning), r)
 				w.Header().Set("Content-Type", "application/json; charset=utf-8")
 				w.Header().Set("X-Loomy-Account", acc.Name)
 				w.WriteHeader(200)
@@ -1355,9 +1351,25 @@ func rejectImageModel(w http.ResponseWriter, model string) {
 		"invalid_request_error")
 }
 
-func (h *Handler) record(r usage.Record) {
+// record 记台账，并统一补「来源 / 出口」两个方向字段。
+//
+// 集中补的原因：原先 7 个调用点各写一遍 ClientIP / UserAgent，其中两处漏了
+// （chat 聚合、失败行）；而 Egress 只在 stdout 日志行里有、台账里完全没有，
+// 于是面板「请求记录」看不出某次请求走的哪个出口 —— 排查风控 / 超时时恰恰最需要它。
+func (h *Handler) record(rec usage.Record, r *http.Request, acc *pool.Account) {
+	if r != nil {
+		if rec.ClientIP == "" {
+			rec.ClientIP = h.requestIP(r)
+		}
+		if rec.UserAgent == "" {
+			rec.UserAgent = h.sourceUA(r)
+		}
+	}
+	if rec.Egress == "" {
+		rec.Egress = h.egressLabel(acc)
+	}
 	if h.Ledger != nil {
-		h.Ledger.Record(r)
+		h.Ledger.Record(rec)
 	}
 }
 
@@ -1374,8 +1386,8 @@ func (h *Handler) noteFail(r *http.Request, kind, model string, acc *pool.Accoun
 	h.record(usage.Record{
 		Account: name, Model: model, Kind: kind, Status: status,
 		LatencyMs: time.Since(started).Milliseconds(),
-		ClientIP:  clientIP(r), UserAgent: ua(r), Error: truncate(body, 300),
-	})
+		Error:     truncate(body, 300),
+	}, r, acc)
 }
 
 // fail 记失败台账并回写上游错误体。
@@ -1393,16 +1405,54 @@ func (h *Handler) requestIP(r *http.Request) string {
 	return clientIP(r)
 }
 
-// egressLabel 该账号实际使用的出口 IP（未启用出口隔离时为空）。
-// 请求行里带上它，排查「某号为什么被风控」时不用再猜它走哪个出口。
+// egressLabel 本次请求**实际走出去**的出口标签（语义对齐 workbuddy2api）：
+//
+//	""        未配置出口隔离 —— 不追加字段，旧日志格式保持不变
+//	"1.2.3.4" 已启用且该账号有分配
+//	"direct"  已启用但这次请求没绑定账号（未知 session 回落默认出口）
+//
+// 看到 direct 就说明这一请求没走专属出口，是排查「为什么这个号被风控」的第一线索。
 func (h *Handler) egressLabel(acc *pool.Account) string {
-	if h.Egress == nil || acc == nil {
+	if h.Egress == nil || !h.Egress.Enabled() {
 		return ""
 	}
-	return h.Egress.IPString(acc.Name)
+	if acc == nil {
+		return "direct"
+	}
+	if ip := h.Egress.IPString(acc.Name); ip != "" {
+		return ip
+	}
+	return "direct"
 }
 
-func (h *Handler) logCall(acc *pool.Account, model string, status int, d time.Duration, note, ip string) {
+// sourceUA 调用来源 UA（log_client_info 关闭时不采集，与来源 IP 同一个开关）。
+func (h *Handler) sourceUA(r *http.Request) string {
+	if h.Cfg == nil || !h.Cfg.SendClientInfo || r == nil {
+		return ""
+	}
+	return ua(r)
+}
+
+// originFields 日志尾段的方向信息：先「从哪个出口出去」，再「谁调进来」。
+//
+// 对齐 workbuddy2api 的 `egress=<ip> src=<ip> ua="<client>"` 口径。历史格式只有
+// `ip=… egress=…`，两个 IP 并排且都叫 ip，很容易读反方向；改成语义明确的
+// src / egress 并固定顺序，UA 用短标签（完整值仍在台账里）。
+func (h *Handler) originFields(acc *pool.Account, r *http.Request) string {
+	var parts []string
+	if e := h.egressLabel(acc); e != "" {
+		parts = append(parts, "egress="+e)
+	}
+	if ip := h.requestIP(r); ip != "" {
+		parts = append(parts, "src="+ip)
+	}
+	if s := shortUA(h.sourceUA(r)); s != "" {
+		parts = append(parts, `ua="`+s+`"`)
+	}
+	return strings.Join(parts, " ")
+}
+
+func (h *Handler) logCall(acc *pool.Account, model string, status int, d time.Duration, note string, r *http.Request) {
 	if !h.Cfg.LogRequests {
 		return
 	}
@@ -1411,18 +1461,16 @@ func (h *Handler) logCall(acc *pool.Account, model string, status int, d time.Du
 		name = acc.Name
 	}
 	seq := h.reqSeq.Add(1)
-	if ip != "" {
-		note = strings.TrimSpace(note + " ip=" + ip)
-	}
-	if e := h.egressLabel(acc); e != "" {
-		note = strings.TrimSpace(note + " egress=" + e)
+	note = strings.TrimSpace(note)
+	if o := h.originFields(acc, r); o != "" {
+		note = note + " | " + o
 	}
 	log.Printf("| #%03d | %s | %-11s | %3d | %s | %6dms | %s |",
 		seq, time.Now().Format("15:04:05"), truncate(model, 11), status,
 		truncate(name, 20), d.Milliseconds(), note)
 }
 
-func (h *Handler) logStream(acc *pool.Account, model string, d time.Duration, ttfbMs, completion, reasoning, pts int64, ip string) {
+func (h *Handler) logStream(acc *pool.Account, model string, d time.Duration, ttfbMs, completion, reasoning, pts int64, r *http.Request) {
 	if !h.Cfg.LogRequests {
 		return
 	}
@@ -1439,11 +1487,8 @@ func (h *Handler) logStream(acc *pool.Account, model string, d time.Duration, tt
 	if reasoning > 0 {
 		extra = fmt.Sprintf(" think=%d", reasoning)
 	}
-	if ip != "" {
-		extra += " ip=" + ip
-	}
-	if e := h.egressLabel(acc); e != "" {
-		extra += " egress=" + e
+	if o := h.originFields(acc, r); o != "" {
+		extra += " | " + o
 	}
 	log.Printf("| #%03d | %s | %-11s | stream | 200 | %s | TTFB=%dms | tok=%d%s | %s | total=%s |",
 		seq, time.Now().Format("15:04:05"), truncate(model, 11), truncate(name, 20),
