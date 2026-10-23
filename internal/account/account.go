@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/rsfree/loomy2api/internal/egress"
 )
 
 // SessionExpireSeconds 客户端固定申请 14 天登录态。
@@ -79,11 +82,16 @@ type Client struct {
 	AKSecret string
 	Proxy    string
 	HTTP     *http.Client
+
+	// Egress 出口隔离：登录 / 额度等账号域请求也按账号绑定源 IP。
+	// 与模型网关用同一份分配，避免「同一账号在两条链路上出口不同」。
+	Egress  *egress.Resolver
+	clients *egress.ClientCache
 }
 
 // NewClient 构造账号服务客户端。
 func NewClient(base, appID, akID, akSecret, proxy string) *Client {
-	return &Client{
+	c := &Client{
 		BaseURL:  strings.TrimRight(base, "/"),
 		AppID:    appID,
 		AKID:     akID,
@@ -91,6 +99,33 @@ func NewClient(base, appID, akID, akSecret, proxy string) *Client {
 		Proxy:    proxy,
 		HTTP:     &http.Client{Timeout: 30 * time.Second},
 	}
+	c.clients = egress.NewClientCache(func(ip net.IP) *http.Client {
+		return &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout:   15 * time.Second,
+					KeepAlive: 30 * time.Second,
+					LocalAddr: &net.TCPAddr{IP: ip},
+				}).DialContext,
+				MaxIdleConnsPerHost: 8,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		}
+	})
+	return c
+}
+
+// httpFor 取该账号应使用的 client；未启用出口隔离时用默认 client。
+func (c *Client) httpFor(identity string) *http.Client {
+	if c == nil || c.Egress == nil || !c.Egress.Enabled() || identity == "" {
+		return c.HTTP
+	}
+	ip := c.Egress.IP(identity)
+	if ip == nil {
+		return c.HTTP
+	}
+	return c.clients.Get(ip)
 }
 
 // envelope 账号服务统一请求信封。
@@ -112,7 +147,13 @@ func (c *Client) envelope(ident Identity, param map[string]any) map[string]any {
 }
 
 // Call 发送一次签名请求，返回解析后的 JSON。
+// Call 发一次签名请求（不绑定出口；账号域调用请用 callAs 传账号名）。
 func (c *Client) Call(path string, body map[string]any) (map[string]any, error) {
+	return c.callAs("", path, body)
+}
+
+// callAs 按账号绑定出口发请求。identity 为空 = 默认出口。
+func (c *Client) callAs(identity, path string, body map[string]any) (map[string]any, error) {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -127,7 +168,7 @@ func (c *Client) Call(path string, body map[string]any) (map[string]any, error) 
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpFor(identity).Do(req)
 	if err != nil {
 		return nil, &Error{Path: path, Code: "NETWORK", Message: err.Error(), Retryable: true}
 	}
@@ -189,15 +230,22 @@ type LoginResult struct {
 // LoginByPassword 手机号 + 密码登录（全自动，无需验证码）。
 func (c *Client) LoginByPassword(loginID, password string, ident Identity) (*LoginResult, error) {
 	ident = ident.orDefault()
-	pubkey, rcode, err := c.PublicKey(ident)
+	// getPuKey 在同一出口取：公钥与登录请求若来自不同 IP，风控看到的是
+	// 一次「刚换过网络」的登录，等于自找验证码。
+	pkOut, err := c.callAs(loginID, "/login/account/getPuKey", c.envelope(ident, nil))
 	if err != nil {
 		return nil, err
+	}
+	pkData := mapOf(pkOut["data"])
+	pubkey, rcode := strOf(pkData["pukey"]), strOf(pkData["rcode"])
+	if pubkey == "" {
+		return nil, &Error{Path: "/login/account/getPuKey", Code: "NO_PUKEY", Message: "服务端未返回公钥"}
 	}
 	enc, err := RSAEncrypt(pubkey, password)
 	if err != nil {
 		return nil, err
 	}
-	out, err := c.Call("/login/account/byPwd", c.envelope(ident, map[string]any{
+	out, err := c.callAs(loginID, "/login/account/byPwd", c.envelope(ident, map[string]any{
 		"loginid":  loginID,
 		"password": enc,
 		"rcode":    rcode,
@@ -212,14 +260,14 @@ func (c *Client) LoginByPassword(loginID, password string, ident Identity) (*Log
 
 // SendSmsCode 发送短信验证码。
 func (c *Client) SendSmsCode(phone string, ident Identity) (map[string]any, error) {
-	return c.Call("/login/phone/sendMsgCode", c.envelope(ident.orDefault(), map[string]any{
+	return c.callAs(phone, "/login/phone/sendMsgCode", c.envelope(ident.orDefault(), map[string]any{
 		"ccode": "86", "phone": phone, "expire": 300,
 	}))
 }
 
 // LoginBySms 短信验证码登录。
 func (c *Client) LoginBySms(phone, code, msgID string, ident Identity) (*LoginResult, error) {
-	out, err := c.Call("/login/phone/checkCode", c.envelope(ident.orDefault(), map[string]any{
+	out, err := c.callAs(phone, "/login/phone/checkCode", c.envelope(ident.orDefault(), map[string]any{
 		"ccode": "86", "phone": phone, "mcode": code, "msgid": msgID,
 		"expire": SessionExpireSeconds,
 	}))

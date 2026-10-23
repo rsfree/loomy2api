@@ -18,6 +18,7 @@ import (
 
 	"github.com/rsfree/loomy2api/internal/account"
 	"github.com/rsfree/loomy2api/internal/config"
+	"github.com/rsfree/loomy2api/internal/egress"
 	"github.com/rsfree/loomy2api/internal/panel"
 	"github.com/rsfree/loomy2api/internal/pool"
 	"github.com/rsfree/loomy2api/internal/server"
@@ -76,6 +77,20 @@ func main() {
 	akID, akSecret := cfg.AccessKey()
 	accClient := account.NewClient(cfg.AccountBase, cfg.AccountAppID, akID, akSecret, cfg.Proxy)
 
+	// ---- 出口隔离：账号 → 本机源 IP ----
+	// 账号集合（而不是请求）决定分配，所以启动后先算一遍；之后面板增删账号
+	// 通过 OnChange 增量重算。未配置 mode=local 时保持单出口，行为与旧版一致。
+	eg := egress.New(cfg.Egress)
+	if eg.Enabled() {
+		log.Printf("出口隔离：%s（按账号 hash 分配）", eg.Describe())
+	} else if cfg.Egress.Mode == egress.ModeLocal {
+		log.Printf("⚠️  出口隔离未生效：%v", eg.Error())
+	}
+	up.SetEgress(eg, p.SessionOwner)
+	accClient.Egress = eg
+	eg.Rebuild(p.Names())
+	p.OnChange = func() { eg.Rebuild(p.Names()) }
+
 	// ---- 台账 ----
 	usagePath := stateSibling(stateFile, "usage.jsonl")
 	ledger := usage.New(usagePath, cfg.UsageMaxEntries)
@@ -84,10 +99,12 @@ func main() {
 
 	// ---- 网关 ----
 	h := server.New(cfg, p, up, ledger)
+	h.Egress = eg
 	server.Version = appVersion
 
 	// ---- 面板 ----
 	pl := panel.New(cfg, p, accClient, up, ledger, h.Models, appVersion)
+	pl.SetEgress(eg)
 	// log 包输出镜像进面板日志环：请求表格行（`| #001 |…`）按 chat 频道归类，
 	// 面板「运行日志」因此能看到对话流水而不只是面板自己的动作。
 	log.SetOutput(io.MultiWriter(os.Stderr, pl.LogWriter()))

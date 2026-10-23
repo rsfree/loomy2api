@@ -455,7 +455,8 @@ function accRowHtml(s, now, maxCred) {
     '<td class="mark" aria-hidden="true"><i></i></td>' +
     '<td class="who"><div class="nm">' + remarkName(s.name, esc(s.name || '未命名')) + '</div>' +
     '<div class="id">' + esc(s.loginid || (s.userid ? 'uid ' + s.userid : '—')) +
-    (s.session_days_left == null ? '' : ' · 登录态 ' + days) + '</div></td>' +
+    (s.session_days_left == null ? '' : ' · 登录态 ' + days) +
+    (s.egress ? ' · 出口 ' + esc(s.egress) : '') + '</div></td>' +
     '<td>' + st.tag + err + locks + '</td>' +
     '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + fmtPoints(avail) +
     (s.permanent != null && s.daily_balance != null
@@ -630,6 +631,11 @@ async function loadOverview(quiet) {
     const up = Math.floor(d.uptime_sec || 0);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
     $('accNote').textContent = d.total ? d.total + ' 个账号' : '';
+    // 出口分布：把「均匀不均匀」直接写在账号池标题行，不用去数表格。
+    const eg = d.egress || {};
+    $('egressNote').textContent = eg.enabled
+      ? '出口 ' + eg.ips + ' 个 IP · 每 IP ' + eg.min_per_ip + '-' + eg.max_per_ip + ' 个账号'
+      : '';
     renderAccounts(d.accounts || []);
     renderModelLocks(d.model_locks);
     renderDeadModels(d.dead_models);

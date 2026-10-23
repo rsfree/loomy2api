@@ -36,6 +36,17 @@
   "proxy": "",
   "_proxy": "全局出口代理，如 http://127.0.0.1:7890；账号级 proxy 可覆盖",
 
+  "egress": {
+    "_comment": "出口隔离：按账号把上游请求绑定到本机不同源 IP。mode=direct 关闭（默认，行为与旧版一致）；local=按账号 hash 分配本机 IP。local.ips 留空=自动发现本机地址（会把被上游拉黑或连不出去的地址也算进来，生产建议显式列举并先探测）。",
+    "mode": "direct",
+    "local": {
+      "ips": [],
+      "interfaces": [],
+      "include_ipv6": false
+    }
+  },
+  "_egress": "多 IP 机器上开启后，每个账号固定走一个出口；账号数/IP 数尽量均匀（各 IP 差 ≤1）。需要容器使用 host 网络，否则进程看不到本机公网 IP。",
+
   "default_model": "imodel/deepseek-v4-flash-0731",
   "_default_model": "请求未写 model 时的对话模型",
   "image_fallback_model": "doubao-seedream-5-lite",

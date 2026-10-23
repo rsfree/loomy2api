@@ -62,6 +62,10 @@ type Pool struct {
 
 	sticky *Sticky
 
+	// OnChange 账号集合变化（增/删/加载）后的回调，用于重算出口分配。
+	// 在锁外调用：回调里可能反向读池（Names），持锁会死锁。
+	OnChange func()
+
 	stateFp   string
 	dirty     atomic.Bool
 	stopCh    chan struct{}
@@ -183,7 +187,6 @@ func (p *Pool) Close() {
 // Add 加入或更新一个账号（同名覆盖长期凭证，保留运行态）。
 func (p *Pool) Add(a *Account) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if a.Name == "" {
 		a.Name = a.LoginID
 	}
@@ -201,6 +204,15 @@ func (p *Pool) Add(a *Account) {
 	}
 	p.byName[a.Name] = a
 	p.dirty.Store(true)
+	p.mu.Unlock()
+	p.notifyChange()
+}
+
+// notifyChange 在锁外触发账号集合变化回调。
+func (p *Pool) notifyChange() {
+	if p.OnChange != nil {
+		p.OnChange()
+	}
 }
 
 // Remove 移除账号并删除凭证文件。
@@ -215,7 +227,35 @@ func (p *Pool) Remove(name string) {
 	}
 	p.mu.Unlock()
 	p.dirty.Store(true)
+	p.notifyChange()
 	p.Flush()
+}
+
+// Names 返回全部账号名（稳定顺序，副本）。
+func (p *Pool) Names() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]string, len(p.order))
+	copy(out, p.order)
+	return out
+}
+
+// SessionOwner 按 session 反查账号名（上游调用只带 session，出口绑定要用它）。
+//
+// 线性扫描而不是维护 session 索引：账号数是百级、每次请求一次，收益不值得
+// 引入「重登换 session 时索引要同步」的失效面。
+func (p *Pool) SessionOwner(session string) string {
+	if session == "" {
+		return ""
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, n := range p.order {
+		if a, ok := p.byName[n]; ok && a.Session == session {
+			return n
+		}
+	}
+	return ""
 }
 
 // Get 按名字取账号。

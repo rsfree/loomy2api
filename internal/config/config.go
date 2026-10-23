@@ -18,6 +18,8 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+
+	"github.com/rsfree/loomy2api/internal/egress"
 )
 
 // 上游默认端点（逆向自 Loomy 桌面客户端 0.9.38，见 docs/PROTOCOL.md）。
@@ -92,6 +94,10 @@ type Config struct {
 	AccessKeySec string `json:"access_key_secret"`
 	LoomyVersion string `json:"loomy_version"`
 	Proxy        string `json:"proxy"`
+
+	// Egress 出口隔离：按账号把上游请求绑定到本机不同源 IP。
+	// mode 空 / direct = 保持单出口（内核按默认路由选源）；local = 按账号 hash 分配。
+	Egress egress.Config `json:"egress"`
 
 	DefaultModel string `json:"default_model"`
 	// ImageFallbackModel 图像端点遇到目录里没有的模型名时回退到它（空 = 关闭兜底，仍 404）。
@@ -191,6 +197,7 @@ func Defaults() *Config {
 		BalanceFloor:        0,
 		PreferDaily:         true,
 		StrictModelCheck:    true,
+		Egress:              egress.Config{Mode: egress.ModeDirect},
 		DeadModelTTLDays:    30,
 		UsageMaxEntries:     20000,
 		LogRequests:         true,

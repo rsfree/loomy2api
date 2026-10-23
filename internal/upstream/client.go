@@ -22,6 +22,7 @@ import (
 
 	"github.com/rsfree/loomy2api/internal/account"
 	"github.com/rsfree/loomy2api/internal/config"
+	"github.com/rsfree/loomy2api/internal/egress"
 )
 
 // 真实 /models 响应把「倍率」和「限时免费」都写在展示名里，没有结构化字段：
@@ -44,15 +45,41 @@ type Client struct {
 	Timeout time.Duration
 
 	HTTP *http.Client
+
+	// 出口隔离（按账号绑定本机源 IP）。未配置时保持原有单出口行为。
+	egressResolver *egress.Resolver
+	sessionOwner   func(session string) string
+	clients        *egress.ClientCache
 }
 
 // NewClient 构造客户端。
 func NewClient(base, version, proxy string, timeout time.Duration) *Client {
-	transport := &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+	c := &Client{
+		BaseURL: strings.TrimRight(base, "/"),
+		Version: version,
+		Proxy:   proxy,
+		Timeout: timeout,
+		// 总时长不设上限：长思考 / 长输出不能被掐断。
+		HTTP: &http.Client{Transport: newTransport(nil), Timeout: 0},
+	}
+	// 每个出口一个 Transport：连接池与源地址绑定，混用等于让出口隔离失效。
+	c.clients = egress.NewClientCache(func(ip net.IP) *http.Client {
+		return &http.Client{Transport: newTransport(ip), Timeout: 0}
+	})
+	return c
+}
+
+// newTransport 构造上游 Transport；ip 非空时把源地址钉在该出口。
+func newTransport(ip net.IP) *http.Transport {
+	d := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	if ip != nil {
+		d.LocalAddr = &net.TCPAddr{IP: ip}
+	}
+	return &http.Transport{
+		DialContext:           d.DialContext,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       90 * time.Second,
@@ -60,17 +87,31 @@ func NewClient(base, version, proxy string, timeout time.Duration) *Client {
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
 	}
-	return &Client{
-		BaseURL: strings.TrimRight(base, "/"),
-		Version: version,
-		Proxy:   proxy,
-		Timeout: timeout,
-		HTTP: &http.Client{
-			Transport: transport,
-			// 总时长不设上限：长思考 / 长输出不能被掐断。
-			Timeout: 0,
-		},
+}
+
+// SetEgress 注入出口策略与「会话 → 账号名」映射。
+//
+// 用映射函数而不是在调用点传账号名：所有上游调用（对话、生图、模型目录、
+// 额度）都带 session，一处理完就全覆盖，新增端点也不会漏掉出口绑定。
+func (c *Client) SetEgress(r *egress.Resolver, owner func(session string) string) {
+	c.egressResolver = r
+	c.sessionOwner = owner
+}
+
+// clientFor 取该会话所属账号应使用的 client；未启用/未知会话时回落默认出口。
+func (c *Client) clientFor(session string) *http.Client {
+	if c == nil || c.egressResolver == nil || !c.egressResolver.Enabled() || c.sessionOwner == nil {
+		return c.HTTP
 	}
+	name := c.sessionOwner(session)
+	if name == "" {
+		return c.HTTP
+	}
+	ip := c.egressResolver.IP(name)
+	if ip == nil {
+		return c.HTTP
+	}
+	return c.clients.Get(ip)
 }
 
 // Headers 生成上游请求头。
@@ -138,7 +179,7 @@ func (c *Client) Do(ctx context.Context, method, suffix, session string, payload
 	}
 	req.Header = c.Headers(session, extra)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.clientFor(session).Do(req)
 	if err != nil {
 		return nil, err
 	}

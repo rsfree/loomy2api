@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/rsfree/loomy2api/internal/config"
+	"github.com/rsfree/loomy2api/internal/egress"
 )
 
 // TestHeadersRequired 三个必需头齐全且 Authorization 双写。
@@ -701,5 +702,33 @@ func TestOnboardingPointsSum(t *testing.T) {
 	}
 	if sum != OnboardingTotal {
 		t.Fatalf("表内合计 = %d，期望 %d", sum, OnboardingTotal)
+	}
+}
+
+// TestClientForEgress 出口绑定只对「能识别出账号」的会话生效：
+// 同一个 client 在启用出口隔离后，不同账号拿到不同 Transport（连接池隔离），
+// 未知会话回落默认 client——否则一旦账号表错位，会把流量绑到错误出口。
+func TestClientForEgress(t *testing.T) {
+	c := NewClient("http://127.0.0.1:1", "0.9.38", "", time.Second)
+	owners := map[string]string{"sess-a": "acct-a", "sess-b": "acct-b"}
+	eg := egress.New(egress.Config{Mode: egress.ModeLocal, Local: egress.Local{IPs: []string{"127.0.0.1", "127.0.0.2"}}})
+	eg.Rebuild([]string{"acct-a", "acct-b"})
+	c.SetEgress(eg, func(s string) string { return owners[s] })
+
+	a, b := c.clientFor("sess-a"), c.clientFor("sess-b")
+	if a == c.HTTP || b == c.HTTP {
+		t.Fatal("已识别的会话不该回落默认 client")
+	}
+	if a == b {
+		t.Error("两个账号被分到同一个出口（连接池未隔离）")
+	}
+	if got := c.clientFor("sess-unknown"); got != c.HTTP {
+		t.Error("未知会话应回落默认 client")
+	}
+
+	// 关掉出口隔离后必须完全回到旧行为，避免配置写错时把请求全打到一个坏出口。
+	c.SetEgress(egress.New(egress.Config{Mode: egress.ModeDirect}), nil)
+	if got := c.clientFor("sess-a"); got != c.HTTP {
+		t.Error("direct 模式应使用默认 client")
 	}
 }

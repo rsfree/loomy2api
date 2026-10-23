@@ -18,6 +18,7 @@ import (
 
 	"github.com/rsfree/loomy2api/internal/bridge"
 	"github.com/rsfree/loomy2api/internal/config"
+	"github.com/rsfree/loomy2api/internal/egress"
 	"github.com/rsfree/loomy2api/internal/httpauth"
 	"github.com/rsfree/loomy2api/internal/pool"
 	"github.com/rsfree/loomy2api/internal/upstream"
@@ -31,6 +32,8 @@ type Handler struct {
 	Upstream *upstream.Client
 	Ledger   *usage.Ledger
 	Models   *ModelCache
+	// Egress 出口分配（日志里标出该账号实际用的源 IP；未启用时为空）。
+	Egress *egress.Resolver
 
 	reqSeq  atomic.Int64
 	started time.Time
@@ -1390,6 +1393,15 @@ func (h *Handler) requestIP(r *http.Request) string {
 	return clientIP(r)
 }
 
+// egressLabel 该账号实际使用的出口 IP（未启用出口隔离时为空）。
+// 请求行里带上它，排查「某号为什么被风控」时不用再猜它走哪个出口。
+func (h *Handler) egressLabel(acc *pool.Account) string {
+	if h.Egress == nil || acc == nil {
+		return ""
+	}
+	return h.Egress.IPString(acc.Name)
+}
+
 func (h *Handler) logCall(acc *pool.Account, model string, status int, d time.Duration, note, ip string) {
 	if !h.Cfg.LogRequests {
 		return
@@ -1401,6 +1413,9 @@ func (h *Handler) logCall(acc *pool.Account, model string, status int, d time.Du
 	seq := h.reqSeq.Add(1)
 	if ip != "" {
 		note = strings.TrimSpace(note + " ip=" + ip)
+	}
+	if e := h.egressLabel(acc); e != "" {
+		note = strings.TrimSpace(note + " egress=" + e)
 	}
 	log.Printf("| #%03d | %s | %-11s | %3d | %s | %6dms | %s |",
 		seq, time.Now().Format("15:04:05"), truncate(model, 11), status,
@@ -1426,6 +1441,9 @@ func (h *Handler) logStream(acc *pool.Account, model string, d time.Duration, tt
 	}
 	if ip != "" {
 		extra += " ip=" + ip
+	}
+	if e := h.egressLabel(acc); e != "" {
+		extra += " egress=" + e
 	}
 	log.Printf("| #%03d | %s | %-11s | stream | 200 | %s | TTFB=%dms | tok=%d%s | %s | total=%s |",
 		seq, time.Now().Format("15:04:05"), truncate(model, 11), truncate(name, 20),

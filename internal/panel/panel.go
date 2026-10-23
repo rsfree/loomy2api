@@ -20,6 +20,7 @@ import (
 
 	"github.com/rsfree/loomy2api/internal/account"
 	"github.com/rsfree/loomy2api/internal/config"
+	"github.com/rsfree/loomy2api/internal/egress"
 	"github.com/rsfree/loomy2api/internal/httpauth"
 	"github.com/rsfree/loomy2api/internal/pool"
 	"github.com/rsfree/loomy2api/internal/server"
@@ -35,6 +36,7 @@ type Panel struct {
 	upstream *upstream.Client
 	ledger   *usage.Ledger
 	models   *server.ModelCache
+	egress   *egress.Resolver
 
 	mux *http.ServeMux
 
@@ -67,6 +69,9 @@ func New(cfg *config.Config, p *pool.Pool, acc *account.Client, up *upstream.Cli
 	pl.routes()
 	return pl
 }
+
+// SetEgress 注入出口分配（面板展示「哪个账号走哪个出口」，也是均匀度的自证）。
+func (p *Panel) SetEgress(r *egress.Resolver) { p.egress = r }
 
 // LogWriter 暴露环的 io.Writer：main 用 log.SetOutput(io.MultiWriter(os.Stderr, pl.LogWriter()))
 // 把 log 包输出（含网关请求表格行）镜像进面板「运行日志」。
@@ -152,12 +157,41 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	ov["dead_models"] = p.pool.DeadModels()
 	ov["prefer_daily_quota"] = p.cfg.PreferDaily
 	ov["accounts"] = p.accountRows()
+	ov["egress"] = p.egressSummary()
 
 	windows := map[string]int64{"24h": 86400, "today": todaySeconds(), "3d": 3 * 86400, "7d": 7 * 86400, "30d": 30 * 86400}
 	sum := p.ledger.Summary(windows)
 	ov["usage"] = sum
 	ov["hourly"] = p.ledger.Hourly(24)
 	writeJSON(w, http.StatusOK, ov)
+}
+
+// egressSummary 出口分配概览：几个 IP、每个 IP 背多少账号、分布范围。
+// 「尽量均匀」是这一版的产品要求，所以把 min/max 直接回给面板自证。
+func (p *Panel) egressSummary() map[string]any {
+	if p.egress == nil || !p.egress.Enabled() {
+		return map[string]any{"enabled": false}
+	}
+	stats := p.egress.Stats()
+	lo, hi, first := 0, 0, true
+	for _, n := range stats {
+		if first || n < lo {
+			lo = n
+		}
+		if first || n > hi {
+			hi = n
+		}
+		first = false
+	}
+	return map[string]any{
+		"enabled":    true,
+		"mode":       p.egress.Mode(),
+		"ips":        len(p.egress.LocalIPs()),
+		"assigned":   p.egress.Assigned(),
+		"min_per_ip": lo,
+		"max_per_ip": hi,
+		"stats":      stats,
+	}
 }
 
 // accountRows 账号行 + 台账统计。参考面板的「用量」是累计口径（不是某个窗口），
@@ -182,6 +216,9 @@ func (p *Panel) accountRows() []map[string]any {
 			pub["success_count"] = b.OK
 			pub["err_total"] = b.Fail
 			pub["last_success"] = b.LastOK
+		}
+		if p.egress != nil {
+			pub["egress"] = p.egress.IPString(a.Name)
 		}
 		rows = append(rows, pub)
 	}
