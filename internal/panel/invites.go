@@ -15,6 +15,7 @@ package panel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sort"
 	"strings"
@@ -52,7 +53,12 @@ type inviteRow struct {
 	Applied   string                `json:"applied,omitempty"` // 已绑别人的码
 	Bound     bool                  `json:"bound"`             // 上游 activated
 	Available int64                 `json:"available,omitempty"`
-	Error     string                `json:"error,omitempty"`
+	// Used / Max 走本地口径（InviteUsed / invite_max_uses），不是上游那个
+	// 恒为 1000 的 maxUses：面板要显示的是「这个码还能再邀几个人」。
+	Used      int    `json:"used"`
+	Max       int    `json:"max"`
+	Exhausted bool   `json:"exhausted,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 // canBind 这个号还能不能花掉它的一次性绑定机会。
@@ -99,6 +105,8 @@ func (p *Panel) collectInvites(ctx context.Context) ([]inviteRow, map[string]any
 			SessionOK: acc.SessionValid(), Code: acc.InviteCode,
 			Applied: acc.InviteApplied, Bound: acc.InviteApplied != "",
 			Egress: p.egressOf(acc.Name),
+			Used:   acc.InviteUsed, Max: p.inviteMaxUses(),
+			Exhausted: acc.InviteExhausted,
 		}
 		if acc.Available != nil {
 			rows[i].Available = *acc.Available
@@ -152,40 +160,148 @@ func (p *Panel) collectInvites(ctx context.Context) ([]inviteRow, map[string]any
 		if rows[i].Applied != "" && acc.InviteApplied != rows[i].Applied {
 			acc.InviteApplied, changed = rows[i].Applied, true
 		}
+		// 上游 usedCount 是权威：本地 InviteUsed 只是预占账本（并发选码用），
+		// 两边漂移会让「还剩几格」算错。只升不降——预占后上游还没结算时
+		// usedCount 会小一次，降下来会导致超发。
+		if len(rows[i].Codes) > 0 {
+			if used := int(rows[i].Codes[0].UsedCount); used > acc.InviteUsed {
+				acc.InviteUsed, changed = used, true
+				rows[i].Used = used
+			}
+			if st := rows[i].Codes[0].Status; st != "" && st != "active" && !acc.InviteExhausted {
+				acc.InviteExhausted, changed = true, true
+				rows[i].Exhausted = true
+			}
+		}
 		if changed {
 			p.persist(acc)
 		}
 	}
 
-	return rows, inviteSummary(rows)
+	return rows, inviteSummary(rows, p.inviteMaxUses())
 }
 
-// autoBindInvite 账号进池后自动绑定配置里的邀请码（被邀方 +5000）。
+// inviteCandidate 池里一个还有余量的邀请码。
+type inviteCandidate struct {
+	Owner *pool.Account
+	Code  string
+	Used  int
+}
+
+// inviteMaxUses 单个码能让几个人用（<=0 回落 5）。
+//
+// 这个值必须由配置给，不能读上游 maxUses：后者实测恒为 1000，
+// 而客户端页面上写的是「每个邀请码限 N 人使用」，两者根本不是一回事。
+func (p *Panel) inviteMaxUses() int {
+	if p.cfg.InviteMaxUses > 0 {
+		return p.cfg.InviteMaxUses
+	}
+	return 5
+}
+
+// inviteCodeOwner 按码反查持有者（池内）。
+func (p *Panel) inviteCodeOwner(code string) *pool.Account {
+	for _, a := range p.pool.All() {
+		if a.InviteCode == code {
+			return a
+		}
+	}
+	return nil
+}
+
+// reserveInviteCode 挑一个还有余量的码并**当场占用一格**。
+//
+// 预占而不是「绑完再 ++」：周期扫描是 4 路并发，先查后写会让两个新号
+// 同时认定「还剩最后一格」，结果第 6 个人也绑上了。占用失败则回滚。
+//
+// 挑选顺序：
+//  1. 配置的 invite_code 优先（用户可能想把主号先灌满）；
+//  2. 其余按 InviteUsed 升序——让 121 个码均匀分摊，而不是逮住一个灌到死；
+//  3. 同 usedCount 按账号名排序，保证可复现。
+//
+// 排除：自己的码（绑自己无效）、已置 exhausted 的、用满上限的。
+func (p *Panel) reserveInviteCode(exclude string) (inviteCandidate, bool) {
+	p.invitePickMu.Lock()
+	defer p.invitePickMu.Unlock()
+
+	max := p.inviteMaxUses()
+	pick := func(a *pool.Account) bool {
+		return a != nil && a.Enabled && a.InviteCode != "" && !a.InviteExhausted &&
+			a.InviteUsed < max && a.InviteCode != exclude
+	}
+
+	var best *pool.Account
+	for _, a := range p.pool.All() {
+		if !pick(a) {
+			continue
+		}
+		if best == nil || a.InviteUsed < best.InviteUsed ||
+			(a.InviteUsed == best.InviteUsed && a.Name < best.Name) {
+			best = a
+		}
+	}
+	if pref := strings.TrimSpace(p.cfg.InviteCode); pref != "" {
+		if owner := p.inviteCodeOwner(pref); pick(owner) {
+			best = owner
+		}
+	}
+	if best == nil {
+		return inviteCandidate{}, false
+	}
+	best.InviteUsed++
+	p.persist(best)
+	return inviteCandidate{Owner: best, Code: best.InviteCode, Used: best.InviteUsed}, true
+}
+
+// releaseInviteCode 归还预占的一格（绑定没成）。
+func (p *Panel) releaseInviteCode(c inviteCandidate) {
+	if c.Owner == nil {
+		return
+	}
+	p.invitePickMu.Lock()
+	defer p.invitePickMu.Unlock()
+	if c.Owner.InviteUsed > 0 {
+		c.Owner.InviteUsed--
+	}
+	p.persist(c.Owner)
+}
+
+// markInviteExhausted 上游明确拒绝了这个码：永久不再尝试，换下一个。
+//
+// 不靠猜上限，靠上游的实际拒绝：配 5 而真实是 3，第 4 次被拒这里就置位；
+// 配 3 而真实是 5，只是白放着 2 格（下次把配置调大即可，不会重复撞）。
+func (p *Panel) markInviteExhausted(c inviteCandidate, reason string) {
+	if c.Owner == nil {
+		return
+	}
+	p.invitePickMu.Lock()
+	defer p.invitePickMu.Unlock()
+	c.Owner.InviteExhausted = true
+	p.persist(c.Owner)
+	p.Logf("邀请码 %s（%s）已不可用，标记停用：%s", c.Code, c.Owner.Name, reason)
+}
+
+// autoBindInvite 账号进池后自动绑定一个还有余量的邀请码（被邀方 +5000）。
 //
 // 幂等三层，按代价从低到高排：
 //  1. 本地 invite_applied 非空 → 直接返回，一个上游请求都不发；
 //  2. 上游 activated → 只把「实际绑的是谁」回写本地，不再消耗；
-//  3. 都没有才真绑一次。
+//  3. 都没有才真绑——且最多换 3 个码，被上游拒绝一个就换下一个。
 //
-// 失败不重试：码错、码满、号已绑都是终态，重试只是把同一条错误刷进日志。
-// 下一个登录 / 下一轮定时扫描自然会再碰一次——这也是它同时挂在
-// checkinAndRefresh（即时）和 SweepInvites（兜底）两处的原因。
+// 失败不重试网络错误：网络抖可以等下一个登录/扫描周期；被拒的码却是
+// 终态，必须当场换掉，否则每加一个号都拿同一个废码去撞。
 func (p *Panel) autoBindInvite(acc *pool.Account) (int64, error) {
 	if !p.cfg.InviteAuto {
 		return 0, nil
 	}
-	code := strings.TrimSpace(p.cfg.InviteCode)
-	if code == "" || acc == nil || !acc.Enabled || !acc.SessionValid() {
+	if acc == nil || !acc.Enabled || !acc.SessionValid() {
 		return 0, nil
 	}
 	if acc.InviteApplied != "" {
 		return 0, nil // 一次性资源已经用掉
 	}
-	if acc.InviteCode == code {
-		return 0, nil // 不能绑自己的码
-	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
 	act, err := p.upstream.Activation(ctx, acc.Session)
@@ -200,26 +316,51 @@ func (p *Panel) autoBindInvite(acc *pool.Account) (int64, error) {
 		return 0, nil
 	}
 
-	bound, err := p.upstream.BindInviteCode(ctx, acc.Session, code, acc.Identity.CampusDev)
-	if err != nil {
-		return 0, err
-	}
-	if bound.AlreadyActivated && bound.InviteeReward == 0 {
-		return 0, nil
-	}
+	for attempt := 0; attempt < 3; attempt++ {
+		cand, ok := p.reserveInviteCode(acc.InviteCode)
+		if !ok {
+			return 0, nil // 池内已无余量
+		}
 
-	acc.InviteApplied = code
-	acc.InviteBoundAt = time.Now().Unix()
-	if bound.InviteeReward > 0 {
-		acc.InviteReward += bound.InviteeReward
+		bound, berr := p.upstream.BindInviteCode(ctx, acc.Session, cand.Code, acc.Identity.CampusDev)
+		if berr != nil {
+			p.releaseInviteCode(cand)
+			var ie *upstream.InviteError
+			if errors.As(berr, &ie) && ie.InviteRejectedCode() {
+				p.markInviteExhausted(cand, ie.Desc)
+				continue // 换下一个码
+			}
+			return 0, berr
+		}
+		if bound.AlreadyActivated && bound.InviteeReward == 0 {
+			// 号自己已经绑过（别处绑的），码没问题：回滚占用并记账。
+			p.releaseInviteCode(cand)
+			if bound.AppliedCode != "" {
+				acc.InviteApplied = bound.AppliedCode
+				p.persist(acc)
+			}
+			return 0, nil
+		}
+		if !bound.Activated {
+			p.markInviteExhausted(cand, "上游未返回 activated")
+			continue
+		}
+
+		acc.InviteApplied = cand.Code
+		acc.InviteBoundAt = time.Now().Unix()
+		if bound.InviteeReward > 0 {
+			acc.InviteReward += bound.InviteeReward
+		}
+		if len(bound.Codes) > 0 {
+			acc.InviteCode = bound.Codes[0].Code
+		}
+		p.persist(acc)
+		p.Logf("账号 %s 自动绑定邀请码 %s（%s 的第 %d/%d 次）成功，+%d 积分，出口 %s",
+			acc.Name, cand.Code, cand.Owner.Name, cand.Used, p.inviteMaxUses(),
+			bound.InviteeReward, p.egressTag(acc.Name))
+		return bound.InviteeReward, nil
 	}
-	if len(bound.Codes) > 0 {
-		acc.InviteCode = bound.Codes[0].Code
-	}
-	p.persist(acc)
-	p.Logf("账号 %s 自动绑定邀请码 %s 成功（+%d 积分，出口 %s）",
-		acc.Name, code, bound.InviteeReward, p.egressTag(acc.Name))
-	return bound.InviteeReward, nil
+	return 0, nil
 }
 
 // SweepInvites 给池里「还没花掉一次性邀请码」的号补绑配置里的码。
@@ -267,7 +408,7 @@ func (p *Panel) SweepInvites(ctx context.Context) (accounts int, points int64) {
 }
 
 // inviteSummary 顶部统计：多少号可绑、多少已绑、多少无码/异常、预期还能换多少分。
-func inviteSummary(rows []inviteRow) map[string]any {
+func inviteSummary(rows []inviteRow, inviteMaxUses int) map[string]any {
 	var bindable, bound, noCode, failed int
 	for _, r := range rows {
 		switch {
@@ -281,6 +422,18 @@ func inviteSummary(rows []inviteRow) map[string]any {
 			noCode++
 		}
 	}
+	// 剩余「可被邀请」的格子：每个码上限 max，已用 used。这是加新号时真正
+	// 能换钱的余额，比「多少个号还没绑」更接近用户关心的「还能薅多少」。
+	max := inviteMaxUses
+	var slots int
+	for _, r := range rows {
+		if r.Exhausted || r.Code == "" {
+			continue
+		}
+		if left := max - r.Used; left > 0 {
+			slots += left
+		}
+	}
 	// pair 模式每次绑定同时让「被邀方」拿 5000，且邀请方也拿 5000 ——
 	// 但邀请方的 5000 落在别人的号上，所以池子整体收益 = 绑定次数 × 10000。
 	return map[string]any{
@@ -291,6 +444,8 @@ func inviteSummary(rows []inviteRow) map[string]any {
 		"failed":      failed,
 		"reward_each": InviteRewardPerBind,
 		"potential":   int64(bindable) * InviteRewardPerBind * 2,
+		"max_uses":    max,
+		"slots":       slots, // 还能再被多少人绑定（迎新号的总额度）
 	}
 }
 
@@ -377,8 +532,9 @@ func (p *Panel) invitesHandler(w http.ResponseWriter, r *http.Request) {
 		// 新号自动绑码的状态：面板顶部那条开关读它，保存走 POST /panel/api/config
 		// （invite_auto / invite_code 是热生效字段，不需要重启）。
 		"auto": map[string]any{
-			"enabled": p.cfg.InviteAuto,
-			"code":    p.cfg.InviteCode,
+			"enabled":  p.cfg.InviteAuto,
+			"code":     p.cfg.InviteCode,
+			"max_uses": p.inviteMaxUses(),
 		},
 	})
 }

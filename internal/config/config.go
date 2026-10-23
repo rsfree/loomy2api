@@ -145,10 +145,18 @@ type Config struct {
 	// 迟早会忘掉某一个号，那 5000 就永久作废了。
 	// 已有账号不受影响：本地 invite_applied 非空直接跳过，不消耗上游请求。
 	InviteAuto bool `json:"invite_auto"`
-	// InviteCode 要自动绑定的邀请码。空 = 不绑（InviteAuto 形同关闭）。
-	InviteCode          string `json:"invite_code"`
-	QuotaRefreshMinutes int    `json:"quota_refresh_minutes"`
-	BalanceFloor        int    `json:"balance_floor"` // 可用积分低于此值停止接单（0=关闭）
+	// InviteCode 优先使用的邀请码。空 = 完全由池内自动挑（见 InviteMaxUses）。
+	// 配了也不会一直用它：用满 InviteMaxUses 次后自动切到池里其它还有余量的码。
+	InviteCode string `json:"invite_code"`
+	// InviteMaxUses 单个邀请码最多能让几个人使用（用户口径：每个号最多邀请 5 次）。
+	//
+	// 为什么不采信上游的 maxUses：那个字段实测恒为 1000（与客户端页面上
+	// 「每个邀请码限 N 人使用」的文案对不上），拿它当上限等于没有上限。
+	// 真实上限只能靠这个配置 + 绑定失败时把该码标 exhausted 来逼近：
+	// 配大了不会有损失（失败一次立刻标记），配小了会白放着额度不用。
+	InviteMaxUses       int `json:"invite_max_uses"`
+	QuotaRefreshMinutes int `json:"quota_refresh_minutes"`
+	BalanceFloor        int `json:"balance_floor"` // 可用积分低于此值停止接单（0=关闭）
 	// PreferDaily 选号优先花「今日赠送额度」（按自然日清零），再动永久积分。
 	// 上游不会因赠送额度耗尽报错（静默改扣永久积分、照常 200），只能靠排序实现。
 	PreferDaily bool `json:"prefer_daily_quota"`
@@ -211,6 +219,7 @@ func Defaults() *Config {
 		OnboardingAuto:          true,
 		OnboardingIntervalHours: 6,
 		InviteAuto:              true,
+		InviteMaxUses:           5,
 		QuotaRefreshMinutes:     30,
 		BalanceFloor:            0,
 		PreferDaily:             true,

@@ -241,9 +241,12 @@ func TestAutoBindInviteBinds(t *testing.T) {
 
 	pl, p := newTestPanelUpstream(t, srv.URL)
 	pl.cfg.InviteAuto = true
-	pl.cfg.InviteCode = "CARQ4Y"
+	pl.cfg.InviteMaxUses = 5
 
 	expire := time.Now().Add(7 * 24 * time.Hour).Unix()
+	// 码要从池子里来：一个持码号（src）+ 一个待绑号（new1）。
+	src := &pool.Account{Name: "src", Enabled: true, Session: "s-src", ExpireAt: expire, InviteCode: "INV001"}
+	p.Add(src)
 	acc := &pool.Account{Name: "new1", Enabled: true, Session: "s-new", ExpireAt: expire,
 		Identity: account.Identity{CampusDev: "loomy-campus-test"}}
 	p.Add(acc)
@@ -258,8 +261,12 @@ func TestAutoBindInviteBinds(t *testing.T) {
 	if probe.posts != 1 {
 		t.Errorf("POST 次数 %d，期望 1", probe.posts)
 	}
-	if acc.InviteApplied != "CARQ4Y" {
+	if acc.InviteApplied != "INV001" {
 		t.Errorf("invite_applied = %q", acc.InviteApplied)
+	}
+	// 持码方的额度账本要当场 +1（否则下一次选码还会选它）。
+	if src.InviteUsed != 1 {
+		t.Errorf("src.invite_used = %d，期望 1", src.InviteUsed)
 	}
 	if acc.InviteReward != 5000 {
 		t.Errorf("invite_reward = %d", acc.InviteReward)
@@ -327,17 +334,16 @@ func TestAutoBindInviteDisabled(t *testing.T) {
 	acc := &pool.Account{Name: "x", Enabled: true, Session: "s", ExpireAt: expire}
 	p.Add(acc)
 
-	// 开关关
+	// 开关关：连状态都不查。
 	pl.cfg.InviteAuto = false
-	pl.cfg.InviteCode = "CARQ4Y"
 	if pts, _ := pl.autoBindInvite(acc); pts != 0 || probe.gets != 0 {
 		t.Fatalf("关闭时不该动作")
 	}
-	// 开关开但没填码
+	// 开关开但池里一个可用码都没有（只有自己）：同样不发请求。
 	pl.cfg.InviteAuto = true
-	pl.cfg.InviteCode = "  "
-	if pts, _ := pl.autoBindInvite(acc); pts != 0 || probe.gets != 0 {
-		t.Fatalf("空码时不该动作")
+	p.Get("x").InviteCode = "SELF01"
+	if pts, _ := pl.autoBindInvite(acc); pts != 0 {
+		t.Fatalf("池内无余量时不该绑")
 	}
 }
 
@@ -355,6 +361,7 @@ func TestSweepInvites(t *testing.T) {
 	// 测试脚手架自带的 acc1 也是未绑号，先给它记上账，否则它会被扫进来。
 	if a := p.Get("acc1"); a != nil {
 		a.InviteApplied = "PRE001"
+		a.InviteCode = "POOL01" // 作为码源（否则池内无码可绑）
 	}
 	p.Add(&pool.Account{Name: "need", Enabled: true, Session: "s1", ExpireAt: expire})
 	p.Add(&pool.Account{Name: "done", Enabled: true, Session: "s2", ExpireAt: expire, InviteApplied: "OLD999"})
@@ -366,5 +373,119 @@ func TestSweepInvites(t *testing.T) {
 	}
 	if probe.posts != 1 {
 		t.Errorf("POST 次数 %d，期望 1（只处理 need）", probe.posts)
+	}
+}
+
+// TestReserveInviteCodeRespectsMax 选码：用满的不选、优先 used 最少的、
+// 全满时返回 false（不能超发）。
+func TestReserveInviteCodeRespectsMax(t *testing.T) {
+	pl, p := newTestPanelUpstream(t, "http://127.0.0.1:1")
+	pl.cfg.InviteMaxUses = 5
+	expire := time.Now().Add(time.Hour).Unix()
+	p.Add(&pool.Account{Name: "a", Enabled: true, Session: "s", ExpireAt: expire, InviteCode: "MAXED1", InviteUsed: 5})
+	p.Add(&pool.Account{Name: "b", Enabled: true, Session: "s", ExpireAt: expire, InviteCode: "LOW001", InviteUsed: 1})
+	p.Add(&pool.Account{Name: "c", Enabled: true, Session: "s", ExpireAt: expire, InviteCode: "MID001", InviteUsed: 3})
+	p.Add(&pool.Account{Name: "d", Enabled: true, Session: "s", ExpireAt: expire, InviteCode: "DEAD01", InviteExhausted: true})
+
+	// 第一个该挑 used 最少的 LOW001。
+	got, ok := pl.reserveInviteCode("")
+	if !ok || got.Code != "LOW001" {
+		t.Fatalf("选到 %+v ok=%v，期望 LOW001", got, ok)
+	}
+	if p.Get("b").InviteUsed != 2 {
+		t.Errorf("预占后 invite_used = %d，期望 2", p.Get("b").InviteUsed)
+	}
+
+	// 继续占用直到全满：总容量 = b 剩 4 格 + c 剩 2 格 = 6 格。
+	n := 1
+	for {
+		if _, ok := pl.reserveInviteCode(""); !ok {
+			break
+		}
+		n++
+		if n > 20 {
+			t.Fatal("超额发放：池子只有 6 格")
+		}
+	}
+	if n != 6 {
+		t.Errorf("共发出 %d 格，期望 6（low 余 4 + mid 余 2）", n)
+	}
+	// 全满之后必须一个都发不出来。
+	if _, ok := pl.reserveInviteCode(""); ok {
+		t.Error("用满后仍能选到码：会超发")
+	}
+}
+
+// TestReserveInviteCodeSkipsOwn 不能绑自己的码。
+func TestReserveInviteCodeSkipsOwn(t *testing.T) {
+	pl, p := newTestPanelUpstream(t, "http://127.0.0.1:1")
+	pl.cfg.InviteMaxUses = 5
+	expire := time.Now().Add(time.Hour).Unix()
+	p.Add(&pool.Account{Name: "self", Enabled: true, Session: "s", ExpireAt: expire, InviteCode: "SELF01"})
+
+	if got, ok := pl.reserveInviteCode("SELF01"); ok {
+		t.Fatalf("不该选到自己的码：%+v", got)
+	}
+}
+
+// TestAutoBindInviteSwitchesCode 首个码被上游拒绝 → 标记 exhausted 并换下一个。
+func TestAutoBindInviteSwitchesCode(t *testing.T) {
+	var posts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/points/activation") && r.Method == http.MethodPost:
+			atomic.AddInt32(&posts, 1)
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["inviteCode"] == "BAD001" {
+				// 业务错误走 200 + 错误信封，Do 会改判 502。
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"code": "100001", "desc": "邀请码已达使用上限",
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": "000000", "data": map[string]any{
+				"activated": true, "alreadyActivated": false,
+				"inviteeReward": 5000, "currentBalance": 20000,
+				"appliedInvitationCode": body["inviteCode"],
+			}})
+		case strings.HasSuffix(r.URL.Path, "/points/activation"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": "000000", "data": map[string]any{"activated": false}})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	pl, p := newTestPanelUpstream(t, srv.URL)
+	pl.cfg.InviteAuto = true
+	pl.cfg.InviteMaxUses = 5
+	expire := time.Now().Add(7 * 24 * time.Hour).Unix()
+	// 名字排序让 BAD001 的持有者先被选中。
+	bad := &pool.Account{Name: "aaa", Enabled: true, Session: "s", ExpireAt: expire, InviteCode: "BAD001"}
+	good := &pool.Account{Name: "zzz", Enabled: true, Session: "s2", ExpireAt: expire, InviteCode: "GOOD01"}
+	p.Add(bad)
+	p.Add(good)
+	acc := &pool.Account{Name: "newbie", Enabled: true, Session: "s3", ExpireAt: expire}
+	p.Add(acc)
+
+	pts, err := pl.autoBindInvite(acc)
+	if err != nil {
+		t.Fatalf("应换码成功而不是报错: %v", err)
+	}
+	if pts != 5000 {
+		t.Errorf("到账 %d，期望 5000", pts)
+	}
+	if atomic.LoadInt32(&posts) != 2 {
+		t.Errorf("POST 次数 %d，期望 2（先 BAD 再 GOOD）", posts)
+	}
+	if !bad.InviteExhausted {
+		t.Error("BAD001 应被标记 exhausted")
+	}
+	if good.InviteUsed != 1 {
+		t.Errorf("GOOD01 应被占用 1 格，实际 %d", good.InviteUsed)
+	}
+	if acc.InviteApplied != "GOOD01" {
+		t.Errorf("invite_applied = %q", acc.InviteApplied)
 	}
 }

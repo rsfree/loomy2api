@@ -1595,6 +1595,7 @@ function renderInvites(d) {
   $('ivBound').textContent = sum.bound || 0;
   $('ivNoCode').textContent = sum.no_code || 0;
   $('ivFailed').textContent = sum.failed || 0;
+  $('ivSlots').textContent = (sum.slots || 0) + ' 格';
   $('ivPotential').textContent = fmtPoints(sum.potential || 0);
   $('ivMatrixNote').textContent = (sum.bindable || 0) + ' 个号还能绑 · 单次双边各 ' + fmtPoints(sum.reward_each || 5000);
   $('btnIvPlan').disabled = false;
@@ -1606,6 +1607,7 @@ function renderInvites(d) {
   if (!ivAutoDirty) {
     $('ivAutoOn').checked = !!auto.enabled;
     $('ivAutoCode').value = auto.code || '';
+    $('ivMaxUses').value = auto.max_uses || 5;
   }
   $('ivAutoNote').textContent = auto.enabled
     ? (auto.code ? '已启用 · 绑 ' + auto.code : '已启用，但没填码（不会动作）')
@@ -1640,10 +1642,10 @@ function renderIvRows() {
   const pg = pageSlice(rows, ivFilter);
   renderPager('ivPager', pg, ivFilter, renderIvRows);
   body.innerHTML = pg.rows.map(r => {
-    const codes = r.codes || [];
-    const main = codes[0] || null;
-    const used = main ? (Number(main.usedCount) || 0) : 0;
-    const cap = main ? (Number(main.maxUses) || 0) : 0;
+    // 用后端的本地口径（used/max）：上游 maxUses 恒为 1000，显示它等于没有上限。
+    const used = Number(r.used) || 0;
+    const cap = Number(r.max) || 0;
+    const left = Math.max(0, cap - used);
     const st = r.error
       ? '<span class="tag bad" title="' + esc(r.error) + '">查询失败</span>'
       : r.bound
@@ -1656,7 +1658,10 @@ function renderIvRows() {
         ? '<span class="tag mute" title="被邀请数 / 上限">' + esc(r.code) + '</span>'
         : '<span class="dim">—</span>') + '</td>'
       + '<td>' + (r.applied ? '<span class="tag ok">' + esc(r.applied) + '</span>' : '<span class="dim">未绑定</span>') + '</td>'
-      + '<td class="num">' + (main ? used + ' / ' + cap : '—') + '</td>'
+      + '<td class="num">' + (r.code
+        ? used + ' / ' + cap + (r.exhausted ? ' <span class="tag bad" title="上游已拒绝该码">停用</span>'
+          : left > 0 ? '' : ' <span class="tag warn" title="已用满，不再参与自动分配">满</span>')
+        : '—') + '</td>'
       + '<td class="mono dim">' + esc(r.egress || '—') + '</td>'
       + '<td>' + st + '</td>'
       + '</tr>';
@@ -1665,6 +1670,7 @@ function renderIvRows() {
 
 $('ivAutoOn').onchange = () => { ivAutoDirty = true; $('ivAutoNote').textContent = '未保存'; };
 $('ivAutoCode').oninput = () => { ivAutoDirty = true; $('ivAutoNote').textContent = '未保存'; };
+$('ivMaxUses').oninput = () => { ivAutoDirty = true; $('ivAutoNote').textContent = '未保存'; };
 $('btnIvAutoSave').onclick = async () => {
   const btn = $('btnIvAutoSave');
   btn.disabled = true; btn.textContent = '保存中…';
@@ -1676,6 +1682,7 @@ $('btnIvAutoSave').onclick = async () => {
       body: JSON.stringify({
         invite_auto: $('ivAutoOn').checked,
         invite_code: ($('ivAutoCode').value || '').trim(),
+        invite_max_uses: Math.max(1, Number($('ivMaxUses').value) || 5),
       }),
     });
     ivAutoDirty = false;

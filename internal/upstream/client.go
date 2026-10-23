@@ -955,7 +955,32 @@ func (c *Client) BindInviteCode(ctx context.Context, session, code, deviceID str
 		return nil, err
 	}
 	if status != 200 {
+		// 业务失败（码满 / 码失效 / 这个号已绑过）被上游塞进 200 的 body，
+		// Do 按错误信封改判 502。把 desc 带出来：调用方要靠它区分
+		// 「这个码废了，换一个」和「网络抖了，下次再来」——两者处理完全相反。
+		if d := str(obj["desc"]); d != "" {
+			return nil, &InviteError{Desc: d}
+		}
 		return nil, fmt.Errorf("/points/activation HTTP %d", status)
 	}
 	return parseActivation(obj), nil
+}
+
+// InviteError 绑定邀请码的业务失败（区别于网络/HTTP 错误）。
+//
+// 用类型而不是字符串匹配来让调用方分支：网络错误重试有意义，
+// 业务失败重试只是把同一条错误再打一遍。
+type InviteError struct{ Desc string }
+
+func (e *InviteError) Error() string { return e.Desc }
+
+// InviteRejectedCode 「这次失败是不是码本身不能再用了」。
+//
+// 上游没有结构化错误码，只能看中文 desc：提到「已绑」的是这个号自己
+// 已经有邀请码了（码没问题，号没救），其余一律按码的问题处理——
+// 误判的代价只是少用一个码（池子里还有一百多个），不误判的代价是
+// 每次加号都拿一个废码去撞，永远绑不上。
+func (e *InviteError) InviteRejectedCode() bool {
+	d := e.Desc
+	return !strings.Contains(d, "已绑") && !strings.Contains(d, "已经绑定")
 }

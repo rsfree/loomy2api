@@ -54,6 +54,13 @@ type Account struct {
 	InviteApplied string `json:"invite_applied,omitempty"` // 自己绑过的别人的码
 	InviteReward  int64  `json:"invite_reward,omitempty"`  // 从邀请码累计拿到的积分
 	InviteBoundAt int64  `json:"invite_bound_at,omitempty"`
+	// InviteUsed 自己这个码已经被几个人用过（本地记账；collectInvites 时用上游
+	// usedCount 校正）。上游 maxUses 恒为 1000 不可信，真实上限由配置
+	// invite_max_uses 决定（默认 5）。
+	InviteUsed int `json:"invite_used,omitempty"`
+	// InviteExhausted 上游明确拒绝过这个码（用完 / 失效）。一旦置位就不再尝试，
+	// 换池里下一个还有余量的码——这比猜上限更可靠。
+	InviteExhausted bool `json:"invite_exhausted,omitempty"`
 
 	// 额度缓存（来自 /points/records + /points/first-login）
 	Balance        *int64 `json:"balance,omitempty"`

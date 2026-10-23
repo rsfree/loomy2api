@@ -353,6 +353,11 @@ POST 的真实响应（2026-10-23 实测，13053042237 绑 CARQ4Y）：
 - **每个号自持 1 个邀请码**（注册即发，`maxUses` 默认 1000，`status=active`），
   所以池子内部可以两两互绑：A 绑 B 的码、B 绑 A 的码，双方各拿 10000。
 - 绑定后 `invitationCodes` 会随响应一起刷新（新号第一次绑定时才拿到自己的码）。
+- 🔴 **`maxUses` 字段不可信**：实测恒为 1000，而客户端页面写的是「每个邀请码限 N 人使用」。
+  真实上限按**每号最多邀请 5 次**处理（`invite_max_uses`，默认 5），
+  并且不靠猜——上游拒绝某个码时把它标 `exhausted` 立刻换下一个，这样配大不留坑。
+- `usedCount` 才是真实使用次数（每被绑一次 +1），面板按 `usedCount / invite_max_uses`
+  显示「还能再邀几个人」。
 
 网关实现：`upstream.InvitationCodes` / `upstream.Activation` / `upstream.BindInviteCode`；
 面板「邀请码」页（`GET /panel/api/invites`、`POST /panel/api/invites/bind`、

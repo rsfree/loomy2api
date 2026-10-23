@@ -125,7 +125,9 @@
   "invite_auto": true,
   "_invite_auto": "新号加入/登录后自动绑定 invite_code（被邀方 +5000，邀请方也 +5000）；一个号只能绑一次、不可逆，本地已绑则零请求",
   "invite_code": "",
-  "_invite_code": "要自动绑定的邀请码（填你自己的码，如 CARQ4Y）；留空 = 不动作",
+  "_invite_code": "优先使用的邀请码（如 CARQ4Y）；留空 = 完全由池内自动挑还有余量的码",
+  "invite_max_uses": 5,
+  "_invite_max_uses": "单个码最多能被几个人使用（每号最多邀请 5 次）；上游 maxUses 恒为 1000，不可信，以这里为准",
   "_quota_refresh_minutes": "后台全量额度刷新间隔（分钟）",
 
   "usage_max_entries": 20000,

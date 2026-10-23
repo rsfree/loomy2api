@@ -1007,6 +1007,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat"><div class="v" id="ivBound">-</div><div class="k">已绑定</div></div>
         <div class="stat"><div class="v" id="ivNoCode">-</div><div class="k">无自持码</div></div>
         <div class="stat"><div class="v" id="ivFailed">-</div><div class="k">查询失败</div></div>
+        <div class="stat good"><div class="v" id="ivSlots">-</div><div class="k">可用邀请名额</div></div>
         <div class="stat warn"><div class="v" id="ivPotential">-</div><div class="k">预期可换积分</div></div>
       </div>
 
@@ -1015,7 +1016,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <h3>新号自动绑码 <span class="hint">账号加入或登录时，自动花掉它的一次性名额</span></h3>
           <span class="grow"></span>
           <span class="note" id="ivAutoNote">—</span>
-          <input id="ivAutoCode" type="text" placeholder="邀请码，如 CARQ4Y" aria-label="自动绑定的邀请码">
+          <input id="ivAutoCode" type="text" placeholder="优先码（可留空 = 全自动挑）" aria-label="优先使用的邀请码">
+          <label class="ck" title="单个码最多能被几个人使用；上游 maxUses 恒为 1000 不可信，以这里为准">
+            每码上限 <input id="ivMaxUses" type="number" min="1" max="100" style="width:64px">
+          </label>
           <label class="ck"><input type="checkbox" id="ivAutoOn"> 启用</label>
           <button class="xs" id="btnIvAutoSave">保存</button>
         </header>
@@ -1055,7 +1059,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <th>账号</th>
               <th>自持邀请码</th>
               <th>已绑定别人的码</th>
-              <th class="num">被邀请数</th>
+              <th class="num">已邀 / 上限</th>
               <th>出口</th>
               <th>状态</th>
             </tr></thead>

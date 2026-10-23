@@ -68,6 +68,10 @@ type Panel struct {
 	inviteMu  sync.Mutex
 	inviteJob *inviteJob
 
+	// 自动绑码的「选码 + 占用额度」临界区：周期扫描 4 路并发，
+	// 先查后写会让两个新号同时认为还剩最后一格（实测会超发）。
+	invitePickMu sync.Mutex
+
 	started time.Time
 }
 
