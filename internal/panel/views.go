@@ -250,6 +250,17 @@ func (p *Panel) creditEntries(ctx context.Context) ([]creditEntry, bool) {
 			// （2026-10-23 实测：121 个号全部能取第 1 页，取 2 页时 partial 恒真）。
 			// 顺带把上游调用从 242 次降到 121 次。
 			obj, err := p.upstream.Records(callCtx, a.Session, 1)
+			if err != nil && callCtx.Err() == nil {
+				// 单次重试：实测偶发 `connection reset by peer`（同一出口上其他账号
+				// 正常），一次重试即可过；否则整张账本被一条瞬时错误标成 partial。
+				select {
+				case <-time.After(150 * time.Millisecond):
+				case <-budget.Done():
+				}
+				if callCtx.Err() == nil {
+					obj, err = p.upstream.Records(callCtx, a.Session, 1)
+				}
+			}
 			if err != nil {
 				mu.Lock()
 				failed++
