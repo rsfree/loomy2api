@@ -188,6 +188,12 @@ type inviteCandidate struct {
 	Used  int
 }
 
+// OnboardingAutoEnabled 新手任务补领是否开启。
+//
+// 它和邀请码兜底共用同一个周期，但**各自独立判断开关**：关掉新手任务补领
+// 不该连带停掉邀请码扫描——后者是一次性资源，漏了没有任何补救机会。
+func (p *Panel) OnboardingAutoEnabled() bool { return p.cfg.OnboardingAuto }
+
 // inviteMaxUses 单个码能让几个人用（<=0 回落 5）。
 //
 // 这个值必须由配置给，不能读上游 maxUses：后者实测恒为 1000，
@@ -369,9 +375,18 @@ func (p *Panel) autoBindInvite(acc *pool.Account) (int64, error) {
 // 只有 login=true 才登），它们的 5000 只会在这一轮里被发现。稳定后的池子
 // 有 0 个待绑号 ⇒ 零上游请求，挂在高频 tick 上也不心疼。
 func (p *Panel) SweepInvites(ctx context.Context) (accounts int, points int64) {
-	if !p.cfg.InviteAuto || strings.TrimSpace(p.cfg.InviteCode) == "" {
+	// 只认开关：invite_code 现在是「优先码」，留空也照样从池里挑，
+	// 所以不再用它当总闸（早先的版本会因此静默不跑）。
+	if !p.cfg.InviteAuto {
 		return 0, 0
 	}
+	defer func() {
+		p.inviteSweepMu.Lock()
+		p.inviteSweepLast = time.Now()
+		p.inviteSweepBind = accounts
+		p.inviteSweepPoints = points
+		p.inviteSweepMu.Unlock()
+	}()
 	var (
 		wg  sync.WaitGroup
 		mu  sync.Mutex
@@ -531,11 +546,7 @@ func (p *Panel) invitesHandler(w http.ResponseWriter, r *http.Request) {
 		"job":      p.inviteJobView(),
 		// 新号自动绑码的状态：面板顶部那条开关读它，保存走 POST /panel/api/config
 		// （invite_auto / invite_code 是热生效字段，不需要重启）。
-		"auto": map[string]any{
-			"enabled":  p.cfg.InviteAuto,
-			"code":     p.cfg.InviteCode,
-			"max_uses": p.inviteMaxUses(),
-		},
+		"auto": p.inviteAutoInfo(),
 	})
 }
 
@@ -761,6 +772,32 @@ func (p *Panel) recordInvite(job *inviteJob, res InviteResult) {
 	default:
 		job.failed++
 	}
+}
+
+// inviteAutoInfo 自动绑码任务的状态（开关 / 优先码 / 上限 / 上次扫描）。
+//
+// last_run 是这台机器上「任务还活着」的证据：池子稳定时每轮都是 0 个待办，
+// 日志里不会有任何输出，只有一个时间戳能证明调度没停。
+func (p *Panel) inviteAutoInfo() map[string]any {
+	out := map[string]any{
+		"enabled":  p.cfg.InviteAuto,
+		"code":     p.cfg.InviteCode,
+		"max_uses": p.inviteMaxUses(),
+		"interval_hours": func() int {
+			if p.cfg.OnboardingIntervalHours > 0 {
+				return p.cfg.OnboardingIntervalHours
+			}
+			return 6
+		}(),
+	}
+	p.inviteSweepMu.Lock()
+	if !p.inviteSweepLast.IsZero() {
+		out["last_run"] = p.inviteSweepLast.Format(time.RFC3339)
+		out["last_bound"] = p.inviteSweepBind
+		out["last_points"] = p.inviteSweepPoints
+	}
+	p.inviteSweepMu.Unlock()
+	return out
 }
 
 // inviteJobView 进度快照（未跑过时 running=false、total=0）。

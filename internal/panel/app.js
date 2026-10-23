@@ -1609,9 +1609,22 @@ function renderInvites(d) {
     $('ivAutoCode').value = auto.code || '';
     $('ivMaxUses').value = auto.max_uses || 5;
   }
-  $('ivAutoNote').textContent = auto.enabled
-    ? (auto.code ? '已启用 · 绑 ' + auto.code : '已启用，但没填码（不会动作）')
-    : '未启用';
+  // 任务状态：池子稳定时每轮都是 0 个待办、日志里一个字都不会有，
+  // 只有一个「上次扫描」时间戳能证明调度还活着。
+  let note;
+  if (!auto.enabled) {
+    note = '未启用';
+  } else {
+    note = '已启用 · ' + (auto.code ? '优先 ' + auto.code : '池内自动挑余量最多的');
+    if (auto.last_run) {
+      const t = new Date(auto.last_run);
+      note += ' · 上次扫描 ' + t.toLocaleTimeString('zh-CN', { hour12: false }).slice(0, 5)
+        + (Number(auto.last_bound) ? '（绑 ' + auto.last_bound + ' 个）' : '（无待办）');
+    } else {
+      note += ' · 每 ' + (auto.interval_hours || 6) + 'h 扫一轮';
+    }
+  }
+  $('ivAutoNote').textContent = note;
 
   // 刷新页面时若后台任务还在跑，直接把进度接上（否则用户会以为任务丢了）。
   if (d.job && d.job.running) startIvPoll();

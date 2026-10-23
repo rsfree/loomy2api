@@ -218,7 +218,9 @@ func background(cfg *config.Config, p *pool.Pool, up *upstream.Client, pl *panel
 			firstOnboard = nil // nil channel 在 select 里永久阻塞 = 只跑一次
 		case <-quota.C:
 			refreshQuotas(p, up)
-			if cfg.OnboardingAuto && time.Since(lastOnboard) >= onboardEvery {
+			// 周期到了就跑一轮运维（内部按各自开关决定做哪几件事），
+			// 不再用 onboarding_auto 一个开关卡住整轮。
+			if time.Since(lastOnboard) >= onboardEvery {
 				runOnboarding(pl)
 				lastOnboard = time.Now()
 			}
@@ -234,10 +236,13 @@ func background(cfg *config.Config, p *pool.Pool, up *upstream.Client, pl *panel
 func runOnboarding(pl *panel.Panel) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	n, pts := pl.AutoOnboarding(ctx)
-	if n > 0 {
-		log.Printf("新手任务自动补领：%d 个账号到账 %d 积分", n, pts)
+	if pl.OnboardingAutoEnabled() {
+		if n, pts := pl.AutoOnboarding(ctx); n > 0 {
+			log.Printf("新手任务自动补领：%d 个账号到账 %d 积分", n, pts)
+		}
 	}
+	// 邀请码兜底：只处理「还没花掉一次性名额」的号，池子稳定时为 0 个待办、
+	// 零上游请求，所以挂在同一个周期上不心疼。
 	if b, ipts := pl.SweepInvites(ctx); b > 0 {
 		log.Printf("邀请码自动绑定：%d 个账号到账 %d 积分", b, ipts)
 	}

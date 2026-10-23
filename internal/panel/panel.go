@@ -72,6 +72,12 @@ type Panel struct {
 	// 先查后写会让两个新号同时认为还剩最后一格（实测会超发）。
 	invitePickMu sync.Mutex
 
+	// 邀请码自动扫描的最近一次运行（面板上要能看出「这个任务还活着」）。
+	inviteSweepMu     sync.Mutex
+	inviteSweepLast   time.Time
+	inviteSweepBind   int
+	inviteSweepPoints int64
+
 	started time.Time
 }
 
