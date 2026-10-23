@@ -881,9 +881,16 @@ func (p *Panel) refreshQuota(acc *pool.Account) {
 	p.persist(acc)
 }
 
-// checkinAndRefresh 复刻真实客户端的登录后动作链：先调 first-login 领每日积分
-// （幂等，失败不阻断），再拉一次完整额度快照落盘。
+// checkinAndRefresh 复刻真实客户端的登录后动作链：先把一次性邀请码用掉，
+// 再调 first-login 领每日积分（幂等，失败不阻断），最后拉完整额度快照落盘。
+//
+// 顺序是有意的：邀请码 +5000 先到账，后面的额度快照才把它算进去；反过来会让
+// 面板上的余额在几秒内跳两次（先 15000 后 20000），看起来像被扣了一笔。
 func (p *Panel) checkinAndRefresh(acc *pool.Account) {
+	// 新号/刚登录的号：配置了 invite_code 就顺手绑掉（本地已绑则零请求）。
+	if _, err := p.autoBindInvite(acc); err != nil {
+		p.Logf("账号 %s 自动绑邀请码失败%s：%v", acc.Name, p.egressTag(acc.Name), err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if _, err := p.doCheckinCtx(ctx, acc); err != nil {

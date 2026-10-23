@@ -1569,6 +1569,8 @@ let ivData = null, ivPlan = null, ivPoll = null;
 /* 121 个号一屏放不下（同账号池）：筛选 + 分页状态放在模块级，
    渲染永远从 ivData 重新派生，不缓存行。 */
 let ivFilter = { q: '', page: 1, size: 20 };
+/* 「新号自动绑码」的输入脏标记：刷新矩阵会重渲染整页，不能把用户正在敲的码冲掉。 */
+let ivAutoDirty = false;
 
 async function loadInvites() {
   const body = $('ivBody');
@@ -1599,6 +1601,16 @@ function renderInvites(d) {
 
   renderIvRows();
 
+  // 自动绑码状态：只在用户没正在编辑时回填，避免刷新把输入冲掉。
+  const auto = d.auto || {};
+  if (!ivAutoDirty) {
+    $('ivAutoOn').checked = !!auto.enabled;
+    $('ivAutoCode').value = auto.code || '';
+  }
+  $('ivAutoNote').textContent = auto.enabled
+    ? (auto.code ? '已启用 · 绑 ' + auto.code : '已启用，但没填码（不会动作）')
+    : '未启用';
+
   // 刷新页面时若后台任务还在跑，直接把进度接上（否则用户会以为任务丢了）。
   if (d.job && d.job.running) startIvPoll();
 
@@ -1615,8 +1627,13 @@ function renderIvRows() {
     || String(r.remark || '').toLowerCase().includes(q)
     || String(r.code || '').toLowerCase().includes(q));
   if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="6"><div class="tk-empty"><div class="big">没有匹配的账号</div>'
-      + '<div>换个关键词试试，或点「刷新」重新读取上游状态。</div></div></td></tr>';
+    // 空池和「筛选无命中」是两件事：前者要去账号池加号，后者只要清空搜索框。
+    const noPool = !(ivData.accounts || []).length;
+    body.innerHTML = noPool
+      ? '<tr><td colspan="6"><div class="tk-empty"><div class="big">还没有账号</div>'
+        + '<div>先在「账号池」添加账号；配了上面的自动绑码后，新号登录时会自动花掉这一次性名额。</div></div></td></tr>'
+      : '<tr><td colspan="6"><div class="tk-empty"><div class="big">没有匹配的账号</div>'
+        + '<div>换个关键词试试，或点「刷新」重新读取上游状态。</div></div></td></tr>';
     renderPager('ivPager', { total: 0, size: ivFilter.size, page: 1, pages: 1 }, ivFilter, renderIvRows);
     return;
   }
@@ -1645,6 +1662,28 @@ function renderIvRows() {
       + '</tr>';
   }).join('');
 }
+
+$('ivAutoOn').onchange = () => { ivAutoDirty = true; $('ivAutoNote').textContent = '未保存'; };
+$('ivAutoCode').oninput = () => { ivAutoDirty = true; $('ivAutoNote').textContent = '未保存'; };
+$('btnIvAutoSave').onclick = async () => {
+  const btn = $('btnIvAutoSave');
+  btn.disabled = true; btn.textContent = '保存中…';
+  try {
+    // 走既有 /panel/api/config：invite_auto / invite_code 是热生效字段，
+    // 不用重启，保存后下一次登录或下一轮扫描就按新值走。
+    await api('config', {
+      method: 'POST',
+      body: JSON.stringify({
+        invite_auto: $('ivAutoOn').checked,
+        invite_code: ($('ivAutoCode').value || '').trim(),
+      }),
+    });
+    ivAutoDirty = false;
+    toast('已保存：新号加入或登录时自动绑码', 'ok');
+    loadInvites();
+  } catch (e) { toast(e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '保存'; }
+};
 
 $('ivQ').oninput = () => { ivFilter.q = $('ivQ').value; ivFilter.page = 1; if (ivData) renderIvRows(); };
 $('btnIvReload').onclick = () => loadInvites();

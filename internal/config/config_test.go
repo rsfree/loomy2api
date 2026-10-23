@@ -507,3 +507,17 @@ func TestOnboardingDefaults(t *testing.T) {
 		t.Errorf("onboarding_interval_hours = %d，期望 6", c.OnboardingIntervalHours)
 	}
 }
+
+// TestInviteDefaults 自动绑码默认「开着但没码」。
+//
+// 这个组合是有意的：开关默认 true 表示「一旦配了码就生效」，而码必须由用户
+// 自己填（不能把某个人的邀请码写进开源默认值）。所以默认状态下零动作、零请求。
+func TestInviteDefaults(t *testing.T) {
+	c := Defaults()
+	if !c.InviteAuto {
+		t.Error("invite_auto 默认应为 true")
+	}
+	if c.InviteCode != "" {
+		t.Errorf("invite_code 默认应为空，得到 %q", c.InviteCode)
+	}
+}

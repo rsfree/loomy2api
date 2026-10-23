@@ -160,6 +160,112 @@ func (p *Panel) collectInvites(ctx context.Context) ([]inviteRow, map[string]any
 	return rows, inviteSummary(rows)
 }
 
+// autoBindInvite 账号进池后自动绑定配置里的邀请码（被邀方 +5000）。
+//
+// 幂等三层，按代价从低到高排：
+//  1. 本地 invite_applied 非空 → 直接返回，一个上游请求都不发；
+//  2. 上游 activated → 只把「实际绑的是谁」回写本地，不再消耗；
+//  3. 都没有才真绑一次。
+//
+// 失败不重试：码错、码满、号已绑都是终态，重试只是把同一条错误刷进日志。
+// 下一个登录 / 下一轮定时扫描自然会再碰一次——这也是它同时挂在
+// checkinAndRefresh（即时）和 SweepInvites（兜底）两处的原因。
+func (p *Panel) autoBindInvite(acc *pool.Account) (int64, error) {
+	if !p.cfg.InviteAuto {
+		return 0, nil
+	}
+	code := strings.TrimSpace(p.cfg.InviteCode)
+	if code == "" || acc == nil || !acc.Enabled || !acc.SessionValid() {
+		return 0, nil
+	}
+	if acc.InviteApplied != "" {
+		return 0, nil // 一次性资源已经用掉
+	}
+	if acc.InviteCode == code {
+		return 0, nil // 不能绑自己的码
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	act, err := p.upstream.Activation(ctx, acc.Session)
+	if err != nil {
+		return 0, err
+	}
+	if act.Activated {
+		if act.AppliedCode != "" && acc.InviteApplied != act.AppliedCode {
+			acc.InviteApplied = act.AppliedCode
+			p.persist(acc)
+		}
+		return 0, nil
+	}
+
+	bound, err := p.upstream.BindInviteCode(ctx, acc.Session, code, acc.Identity.CampusDev)
+	if err != nil {
+		return 0, err
+	}
+	if bound.AlreadyActivated && bound.InviteeReward == 0 {
+		return 0, nil
+	}
+
+	acc.InviteApplied = code
+	acc.InviteBoundAt = time.Now().Unix()
+	if bound.InviteeReward > 0 {
+		acc.InviteReward += bound.InviteeReward
+	}
+	if len(bound.Codes) > 0 {
+		acc.InviteCode = bound.Codes[0].Code
+	}
+	p.persist(acc)
+	p.Logf("账号 %s 自动绑定邀请码 %s 成功（+%d 积分，出口 %s）",
+		acc.Name, code, bound.InviteeReward, p.egressTag(acc.Name))
+	return bound.InviteeReward, nil
+}
+
+// SweepInvites 给池里「还没花掉一次性邀请码」的号补绑配置里的码。
+//
+// 为什么不能只靠登录链路：导入 session 的卡密号根本不走登录（addAccount 里
+// 只有 login=true 才登），它们的 5000 只会在这一轮里被发现。稳定后的池子
+// 有 0 个待绑号 ⇒ 零上游请求，挂在高频 tick 上也不心疼。
+func (p *Panel) SweepInvites(ctx context.Context) (accounts int, points int64) {
+	if !p.cfg.InviteAuto || strings.TrimSpace(p.cfg.InviteCode) == "" {
+		return 0, 0
+	}
+	var (
+		wg  sync.WaitGroup
+		mu  sync.Mutex
+		sem = make(chan struct{}, 4)
+	)
+	for _, a := range p.pool.All() {
+		if !a.Enabled || !a.SessionValid() || a.InviteApplied != "" || a.InviteCode == p.cfg.InviteCode {
+			continue
+		}
+		wg.Add(1)
+		go func(a *pool.Account) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if !p.tryLock(a.Name) {
+				return // 正在登录/签到，下一轮再来
+			}
+			defer p.unlock(a.Name)
+			pts, err := p.autoBindInvite(a)
+			if err != nil {
+				p.Logf("账号 %s 补绑邀请码失败%s：%v", a.Name, p.egressTag(a.Name), err)
+				return
+			}
+			if pts > 0 {
+				mu.Lock()
+				accounts++
+				points += pts
+				mu.Unlock()
+			}
+		}(a)
+	}
+	wg.Wait()
+	return accounts, points
+}
+
 // inviteSummary 顶部统计：多少号可绑、多少已绑、多少无码/异常、预期还能换多少分。
 func inviteSummary(rows []inviteRow) map[string]any {
 	var bindable, bound, noCode, failed int
@@ -268,6 +374,12 @@ func (p *Panel) invitesHandler(w http.ResponseWriter, r *http.Request) {
 		"accounts": rows,
 		"summary":  summary,
 		"job":      p.inviteJobView(),
+		// 新号自动绑码的状态：面板顶部那条开关读它，保存走 POST /panel/api/config
+		// （invite_auto / invite_code 是热生效字段，不需要重启）。
+		"auto": map[string]any{
+			"enabled": p.cfg.InviteAuto,
+			"code":    p.cfg.InviteCode,
+		},
 	})
 }
 

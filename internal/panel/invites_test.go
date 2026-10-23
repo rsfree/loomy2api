@@ -1,13 +1,16 @@
 package panel
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/rsfree/loomy2api/internal/account"
 	"github.com/rsfree/loomy2api/internal/pool"
 )
 
@@ -183,5 +186,185 @@ func TestInvitesBindConflict(t *testing.T) {
 	view := pl.inviteJobView()
 	if view["running"] != true {
 		t.Fatalf("进度快照不对：%+v", view)
+	}
+}
+
+// newInviteUpstream 造一个只认邀请码三端点的假上游。
+// state 用指针传：测试要在断言里看「有没有真的发过 POST」。
+type inviteProbe struct {
+	gets  int32 // GET /points/activation 次数
+	posts int32 // POST /points/activation 次数
+	bound bool  // 是否已绑定
+}
+
+func newInviteUpstream(t *testing.T, probe *inviteProbe) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/points/activation") && r.Method == http.MethodPost:
+			atomic.AddInt32(&probe.posts, 1)
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			probe.bound = true
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": "000000",
+				"data": map[string]any{
+					"activated": true, "alreadyActivated": false,
+					"inviteeReward": 5000, "inviterReward": 5000,
+					"currentBalance": 20000, "permanentBalance": 20000,
+					"appliedInvitationCode": body["inviteCode"],
+					"invitationCodes":       []map[string]any{{"inviteCode": "OWN001", "usedCount": 0, "maxUses": 1000, "status": "active"}},
+				},
+			})
+		case strings.HasSuffix(r.URL.Path, "/points/activation"):
+			atomic.AddInt32(&probe.gets, 1)
+			data := map[string]any{"activated": probe.bound}
+			if probe.bound {
+				data["appliedInvitationCode"] = "OLD999"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": "000000", "data": data})
+		case strings.HasSuffix(r.URL.Path, "/invitation-codes"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": "000000", "data": map[string]any{
+				"list": []map[string]any{{"inviteCode": "OWN001", "usedCount": 0, "maxUses": 1000, "status": "active"}},
+			}})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+}
+
+// TestAutoBindInviteBinds 未绑定账号：查一次 → 绑一次 → 账本落 invite_applied。
+func TestAutoBindInviteBinds(t *testing.T) {
+	probe := &inviteProbe{}
+	srv := newInviteUpstream(t, probe)
+	defer srv.Close()
+
+	pl, p := newTestPanelUpstream(t, srv.URL)
+	pl.cfg.InviteAuto = true
+	pl.cfg.InviteCode = "CARQ4Y"
+
+	expire := time.Now().Add(7 * 24 * time.Hour).Unix()
+	acc := &pool.Account{Name: "new1", Enabled: true, Session: "s-new", ExpireAt: expire,
+		Identity: account.Identity{CampusDev: "loomy-campus-test"}}
+	p.Add(acc)
+
+	pts, err := pl.autoBindInvite(acc)
+	if err != nil {
+		t.Fatalf("自动绑码失败: %v", err)
+	}
+	if pts != 5000 {
+		t.Errorf("到账 %d，期望 5000", pts)
+	}
+	if probe.posts != 1 {
+		t.Errorf("POST 次数 %d，期望 1", probe.posts)
+	}
+	if acc.InviteApplied != "CARQ4Y" {
+		t.Errorf("invite_applied = %q", acc.InviteApplied)
+	}
+	if acc.InviteReward != 5000 {
+		t.Errorf("invite_reward = %d", acc.InviteReward)
+	}
+	// 绑定响应会带回自持码，落进账号（后续可作为邀请方参与互绑）。
+	if acc.InviteCode != "OWN001" {
+		t.Errorf("invite_code = %q", acc.InviteCode)
+	}
+}
+
+// TestAutoBindInviteLocalSkip 本地已记过账：一个上游请求都不发。
+func TestAutoBindInviteLocalSkip(t *testing.T) {
+	probe := &inviteProbe{}
+	srv := newInviteUpstream(t, probe)
+	defer srv.Close()
+
+	pl, p := newTestPanelUpstream(t, srv.URL)
+	pl.cfg.InviteAuto = true
+	pl.cfg.InviteCode = "CARQ4Y"
+
+	acc := &pool.Account{Name: "done1", Enabled: true, Session: "s", ExpireAt: time.Now().Add(time.Hour).Unix(),
+		InviteApplied: "OLD999"}
+	p.Add(acc)
+
+	if pts, err := pl.autoBindInvite(acc); err != nil || pts != 0 {
+		t.Fatalf("应直接跳过: pts=%d err=%v", pts, err)
+	}
+	if probe.gets != 0 || probe.posts != 0 {
+		t.Errorf("不该打上游：gets=%d posts=%d", probe.gets, probe.posts)
+	}
+}
+
+// TestAutoBindInviteUpstreamBound 上游已绑定（本地没记）：只回写、不消耗。
+func TestAutoBindInviteUpstreamBound(t *testing.T) {
+	probe := &inviteProbe{bound: true}
+	srv := newInviteUpstream(t, probe)
+	defer srv.Close()
+
+	pl, p := newTestPanelUpstream(t, srv.URL)
+	pl.cfg.InviteAuto = true
+	pl.cfg.InviteCode = "CARQ4Y"
+
+	acc := &pool.Account{Name: "b1", Enabled: true, Session: "s", ExpireAt: time.Now().Add(time.Hour).Unix()}
+	p.Add(acc)
+
+	if pts, err := pl.autoBindInvite(acc); err != nil || pts != 0 {
+		t.Fatalf("上游已绑应跳过: pts=%d err=%v", pts, err)
+	}
+	if probe.posts != 0 {
+		t.Errorf("不该发 POST，实际 %d 次", probe.posts)
+	}
+	if acc.InviteApplied != "OLD999" {
+		t.Errorf("应回写实际绑定的码，得到 %q", acc.InviteApplied)
+	}
+}
+
+// TestAutoBindInviteDisabled 关闭开关或没填码：零动作、零请求。
+func TestAutoBindInviteDisabled(t *testing.T) {
+	probe := &inviteProbe{}
+	srv := newInviteUpstream(t, probe)
+	defer srv.Close()
+
+	pl, p := newTestPanelUpstream(t, srv.URL)
+	expire := time.Now().Add(time.Hour).Unix()
+	acc := &pool.Account{Name: "x", Enabled: true, Session: "s", ExpireAt: expire}
+	p.Add(acc)
+
+	// 开关关
+	pl.cfg.InviteAuto = false
+	pl.cfg.InviteCode = "CARQ4Y"
+	if pts, _ := pl.autoBindInvite(acc); pts != 0 || probe.gets != 0 {
+		t.Fatalf("关闭时不该动作")
+	}
+	// 开关开但没填码
+	pl.cfg.InviteAuto = true
+	pl.cfg.InviteCode = "  "
+	if pts, _ := pl.autoBindInvite(acc); pts != 0 || probe.gets != 0 {
+		t.Fatalf("空码时不该动作")
+	}
+}
+
+// TestSweepInvites 只扫「未绑 + 有效」的号，已绑的一律不发请求。
+func TestSweepInvites(t *testing.T) {
+	probe := &inviteProbe{}
+	srv := newInviteUpstream(t, probe)
+	defer srv.Close()
+
+	pl, p := newTestPanelUpstream(t, srv.URL)
+	pl.cfg.InviteAuto = true
+	pl.cfg.InviteCode = "CARQ4Y"
+
+	expire := time.Now().Add(7 * 24 * time.Hour).Unix()
+	// 测试脚手架自带的 acc1 也是未绑号，先给它记上账，否则它会被扫进来。
+	if a := p.Get("acc1"); a != nil {
+		a.InviteApplied = "PRE001"
+	}
+	p.Add(&pool.Account{Name: "need", Enabled: true, Session: "s1", ExpireAt: expire})
+	p.Add(&pool.Account{Name: "done", Enabled: true, Session: "s2", ExpireAt: expire, InviteApplied: "OLD999"})
+	p.Add(&pool.Account{Name: "off", Enabled: false, Session: "s3", ExpireAt: expire})
+
+	n, pts := pl.SweepInvites(context.Background())
+	if n != 1 || pts != 5000 {
+		t.Fatalf("扫到 %d 个号 %d 分，期望 1 个 5000", n, pts)
+	}
+	if probe.posts != 1 {
+		t.Errorf("POST 次数 %d，期望 1（只处理 need）", probe.posts)
 	}
 }

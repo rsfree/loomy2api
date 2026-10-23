@@ -226,13 +226,20 @@ func background(cfg *config.Config, p *pool.Pool, up *upstream.Client, pl *panel
 	}
 }
 
-// runOnboarding 跑一轮新手任务补领，只打印真正有到账的那一轮。
+// runOnboarding 跑一轮「账号运维」：新手任务补领 + 一次性邀请码兜底。
+//
+// 两件事共用同一个周期，但触发理由不同：新手任务漏了能补，邀请码是一次性的
+// （一个号只能绑一次），所以邀请码在登录链路里就即时绑掉，这里只兜「不走登录
+// 的号」（导入 session 的卡密号）。池子稳定后待绑数为 0，这一轮是纯本地遍历。
 func runOnboarding(pl *panel.Panel) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	n, pts := pl.AutoOnboarding(ctx)
 	if n > 0 {
 		log.Printf("新手任务自动补领：%d 个账号到账 %d 积分", n, pts)
+	}
+	if b, ipts := pl.SweepInvites(ctx); b > 0 {
+		log.Printf("邀请码自动绑定：%d 个账号到账 %d 积分", b, ipts)
 	}
 }
 

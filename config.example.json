@@ -122,6 +122,10 @@
   "_onboarding_auto": "周期补领新手任务（8 项合计 10000 积分，纯 API 直领、零 token、幂等）；关闭后只能在任务中心手动领取",
   "onboarding_interval_hours": 6,
   "_onboarding_interval_hours": "补领间隔（小时）；启动 90 秒后先跑一轮",
+  "invite_auto": true,
+  "_invite_auto": "新号加入/登录后自动绑定 invite_code（被邀方 +5000，邀请方也 +5000）；一个号只能绑一次、不可逆，本地已绑则零请求",
+  "invite_code": "",
+  "_invite_code": "要自动绑定的邀请码（填你自己的码，如 CARQ4Y）；留空 = 不动作",
   "_quota_refresh_minutes": "后台全量额度刷新间隔（分钟）",
 
   "usage_max_entries": 20000,
