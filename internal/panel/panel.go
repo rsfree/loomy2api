@@ -482,6 +482,7 @@ func (p *Panel) checkinAccount(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	res, err := p.doCheckinCtx(ctx, acc)
 	if err != nil {
+		p.Logf("账号 %s 签到失败%s：%v", name, p.egressTag(name), err)
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -702,6 +703,9 @@ func (p *Panel) refreshAccount(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 	if err := p.refreshQuotaCtx(ctx, acc); err != nil {
+		// 原先这里只把错误回给前端，运行日志里一个字都没有：用户点「余额」看到
+		// 502，排障时无从下手。带上出口 IP 才能区分「账号问题」与「这个出口不通」。
+		p.Logf("账号 %s 额度刷新失败%s：%v", name, p.egressTag(name), err)
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -769,6 +773,7 @@ func (p *Panel) refreshAll(w http.ResponseWriter, r *http.Request) {
 	sem := make(chan struct{}, 4)
 	var mu sync.Mutex
 	results := make([]map[string]any, 0, len(accounts))
+	failByEgress := map[string]int{}
 	for _, a := range accounts {
 		if !a.Enabled || !a.SessionValid() {
 			continue
@@ -784,13 +789,58 @@ func (p *Panel) refreshAll(w http.ResponseWriter, r *http.Request) {
 			item := map[string]any{"name": a.Name, "ok": err == nil}
 			if err != nil {
 				item["error"] = err.Error()
+				// 失败按出口聚合：某个 IP 被上游拉黑时，这里会立刻聚成一堆，
+				// 一眼分得出「号坏了」还是「这条出口坏了」。
+				failByEgress[p.egressOf(a.Name)]++
 			}
 			results = append(results, item)
 		}(a)
 	}
 	wg.Wait()
-	p.Logf("全量刷新额度：%d 个账号", len(results))
+	okCount := len(results) - countValues(failByEgress)
+	p.Logf("全量刷新额度：%d 个账号，成功 %d，失败 %d%s",
+		len(results), okCount, countValues(failByEgress), egressFailNote(failByEgress))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": results, "overview": p.pool.Overview()})
+}
+
+// countValues 汇总 map 里的计数。
+func countValues(m map[string]int) int {
+	n := 0
+	for _, v := range m {
+		n += v
+	}
+	return n
+}
+
+// egressFailNote 把「失败出口 → 次数」拼成一行，按次数降序、同次数按标签升序
+// （排序只为日志稳定可 diff）。空 map 返回空串，未启用出口隔离时不污染日志。
+func egressFailNote(byEgress map[string]int) string {
+	if len(byEgress) == 0 {
+		return ""
+	}
+	type row struct {
+		label string
+		n     int
+	}
+	rows := make([]row, 0, len(byEgress))
+	for ip, n := range byEgress {
+		label := ip
+		if label == "" {
+			label = "direct" // 没绑定账号的调用：走默认出口
+		}
+		rows = append(rows, row{label: label, n: n})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].n != rows[j].n {
+			return rows[i].n > rows[j].n
+		}
+		return rows[i].label < rows[j].label
+	})
+	parts := make([]string, len(rows))
+	for i, r := range rows {
+		parts[i] = fmt.Sprintf("%s×%d", r.label, r.n)
+	}
+	return "（失败出口 " + strings.Join(parts, "、") + "）"
 }
 
 // ------------------------------------------------------------------ 内部

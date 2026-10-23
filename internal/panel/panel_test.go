@@ -1075,3 +1075,48 @@ func TestAutoOnboardingClaimsIncomplete(t *testing.T) {
 		t.Errorf("应为缺的 7 项各发一次，实际 %d 次", len(claims))
 	}
 }
+
+// TestEgressFailNote 全量刷新的失败聚合：按次数降序、同次数按标签升序，
+// 未绑定账号的失败归到 direct。这条行是「出口坏了还是账号坏了」的第一判据。
+func TestEgressFailNote(t *testing.T) {
+	if got := egressFailNote(nil); got != "" {
+		t.Errorf("无失败不该有尾巴，得到 %q", got)
+	}
+	got := egressFailNote(map[string]int{"154.40.45.18": 1, "154.40.45.167": 3, "": 2})
+	want := "（失败出口 154.40.45.167×3、direct×2、154.40.45.18×1）"
+	if got != want {
+		t.Errorf("egressFailNote = %q，期望 %q", got, want)
+	}
+	if n := countValues(map[string]int{"a": 2, "b": 3}); n != 5 {
+		t.Errorf("countValues = %d，期望 5", n)
+	}
+}
+
+// TestAccountOpsLogEgress 单个账号的「刷新额度 / 签到」失败必须留一行日志并带出口：
+// 原先只把错误回给前端，运行日志里什么都没有，用户看到 502 无从排查。
+func TestAccountOpsLogEgress(t *testing.T) {
+	pl, p := newTestPanel(t) // 上游是 upstream.invalid，一定失败
+	pl.SetEgress(newEgressForPanel(t, "acc1"))
+	expire := time.Now().Add(24 * time.Hour).Unix()
+	p.Add(&pool.Account{Name: "acc1", Enabled: true, Session: "sess-1", ExpireAt: expire})
+
+	buf := capturePanelLog(t)
+
+	w := httptest.NewRecorder()
+	pl.refreshAccount(w, withPathValue(httptest.NewRequest(http.MethodPost, "/panel/api/accounts/acc1/balance", nil), "acc1"))
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("状态码 %d，期望 502", w.Code)
+	}
+	w2 := httptest.NewRecorder()
+	pl.checkinAccount(w2, withPathValue(httptest.NewRequest(http.MethodPost, "/panel/api/accounts/acc1/checkin", nil), "acc1"))
+	if w2.Code != http.StatusBadGateway {
+		t.Fatalf("签到状态码 %d，期望 502", w2.Code)
+	}
+
+	out := buf.String()
+	for _, want := range []string{"额度刷新失败（出口 127.0.0.1）", "签到失败（出口 127.0.0.1）"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("日志缺 %q：%s", want, out)
+		}
+	}
+}
