@@ -453,9 +453,21 @@ func TestLogsEndpoint(t *testing.T) {
 	if first["ch"] != ChTask {
 		t.Errorf("频道 = %v，期望 %s", first["ch"], ChTask)
 	}
-	last, _ := entries[len(entries)-1].(map[string]any)
-	if last["ch"] != ChChat {
-		t.Errorf("请求行频道 = %v，期望 %s", last["ch"], ChChat)
+	// 按内容找那行请求，而不是假定它在末尾：log 输出是进程级的，其它测试
+	// 遗留的 goroutine（全量刷额度 / 签到并发 4 路）可能在这之后往同一个环里
+	// 补几行「账号 … 失败」，末尾断言会偶发失败（CI 上真实踩到过）。
+	var chatEntry map[string]any
+	for _, e := range entries {
+		m, _ := e.(map[string]any)
+		if txt, _ := m["text"].(string); strings.HasPrefix(txt, "| #001") {
+			chatEntry = m
+		}
+	}
+	if chatEntry == nil {
+		t.Fatal("没找到请求表格行")
+	}
+	if chatEntry["ch"] != ChChat {
+		t.Errorf("请求行频道 = %v，期望 %s", chatEntry["ch"], ChChat)
 	}
 }
 
