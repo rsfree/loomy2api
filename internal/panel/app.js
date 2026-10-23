@@ -1566,6 +1566,9 @@ start();
    2. 收益是双边的（被邀 5000 / 邀请 5000），所以「两两互绑」比「全灌一个码」平均多一倍；
    3. 批量是后台任务（118 条 × 1.2s ≈ 2.5 分钟），同步请求必然超时 —— 走轮询出进度。 */
 let ivData = null, ivPlan = null, ivPoll = null;
+/* 121 个号一屏放不下（同账号池）：筛选 + 分页状态放在模块级，
+   渲染永远从 ivData 重新派生，不缓存行。 */
+let ivFilter = { q: '', page: 1, size: 20 };
 
 async function loadInvites() {
   const body = $('ivBody');
@@ -1614,9 +1617,12 @@ function renderIvRows() {
   if (!rows.length) {
     body.innerHTML = '<tr><td colspan="6"><div class="tk-empty"><div class="big">没有匹配的账号</div>'
       + '<div>换个关键词试试，或点「刷新」重新读取上游状态。</div></div></td></tr>';
+    renderPager('ivPager', { total: 0, size: ivFilter.size, page: 1, pages: 1 }, ivFilter, renderIvRows);
     return;
   }
-  body.innerHTML = rows.map(r => {
+  const pg = pageSlice(rows, ivFilter);
+  renderPager('ivPager', pg, ivFilter, renderIvRows);
+  body.innerHTML = pg.rows.map(r => {
     const codes = r.codes || [];
     const main = codes[0] || null;
     const used = main ? (Number(main.usedCount) || 0) : 0;
@@ -1640,7 +1646,7 @@ function renderIvRows() {
   }).join('');
 }
 
-$('ivQ').oninput = () => { if (ivData) renderIvRows(); };
+$('ivQ').oninput = () => { ivFilter.q = $('ivQ').value; ivFilter.page = 1; if (ivData) renderIvRows(); };
 $('btnIvReload').onclick = () => loadInvites();
 
 // 预览：把「谁绑谁的码」摊开给人看。不可逆操作不能只给一个按钮。
