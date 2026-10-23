@@ -29,6 +29,12 @@ let usDim = 'account', usCreditDim = 'account', usSort = 'total';
 let usageData = null;
 let reqFilter = { q: '', outcome: '' };
 let reqEntries = [];
+/* 账号池的筛选/分页（121 个号一屏放不下）：q=关键词，state=状态桶，
+   sort=排序，page/size=分页。渲染层永远从 overviewData 重新派生，不缓存行。 */
+let accFilter = { q: '', state: '', sort: 'default', page: 1, size: 20 };
+/* 用量明细与积分扣除的分页互相独立（维度不同、行数不同）。 */
+let usDimFilter = { q: '', page: 1, size: 20 };
+let usCreditFilter = { page: 1, size: 20 };
 
 const $ = id => document.getElementById(id);
 
@@ -357,68 +363,162 @@ function modelLocksHtml(cooldowns, now) {
   }).join('') + '</div>';
 }
 
+/* ── 分页 ─────────────────────────────────────────────────────────── */
+/* pageSlice 按页切片，并把越界页码拉回最后一页：筛选变窄或账号被移除后，
+   原页码常常超出范围，不修正会得到一张空表。 */
+function pageSlice(rows, state) {
+  const size = Math.max(1, Number(state.size) || 20);
+  const pages = Math.max(1, Math.ceil(rows.length / size));
+  const page = Math.min(Math.max(1, Number(state.page) || 1), pages);
+  state.page = page;
+  return { rows: rows.slice((page - 1) * size, page * size), page, pages, size, total: rows.length };
+}
+
+/* renderPager 生成「上一页 / 页码 / 下一页」。按钮走 data-pg + 委托点击，
+   不用内联 onclick（CSP script-src 'self' 会拦掉）。每次重写 onclick 而不是
+   addEventListener：容器会被反复渲染，累加监听会一次点击翻多页。 */
+function renderPager(elId, pg, state, rerender) {
+  const el = $(elId);
+  if (!el) return;
+  if (pg.total <= pg.size) {
+    el.innerHTML = '<span class="info">共 ' + pg.total + ' 条</span>';
+    return;
+  }
+  const nums = [];
+  for (const n of [1, pg.pages, pg.page - 2, pg.page - 1, pg.page, pg.page + 1, pg.page + 2]) {
+    if (n >= 1 && n <= pg.pages && !nums.includes(n)) nums.push(n);
+  }
+  nums.sort((a, b) => a - b);
+  let html = '<span class="info">共 ' + pg.total + ' 条 · 第 ' + pg.page + ' / ' + pg.pages + ' 页</span>' +
+    '<button class="xs ghost" data-pg="prev"' + (pg.page <= 1 ? ' disabled' : '') + '>上一页</button>';
+  let last = 0;
+  for (const n of nums) {
+    if (last && n - last > 1) html += '<span class="gap">…</span>';
+    html += '<button class="xs ' + (n === pg.page ? 'primary' : 'ghost') + '" data-pg="' + n + '">' + n + '</button>';
+    last = n;
+  }
+  html += '<button class="xs ghost" data-pg="next"' + (pg.page >= pg.pages ? ' disabled' : '') + '>下一页</button>';
+  el.innerHTML = html;
+  el.onclick = ev => {
+    const b = ev.target.closest('button[data-pg]');
+    if (!b || b.disabled) return;
+    const v = b.dataset.pg;
+    state.page = v === 'prev' ? pg.page - 1 : v === 'next' ? pg.page + 1 : Number(v);
+    rerender();
+  };
+}
+
+/* accountBucket 把展示状态折成筛选项。accountStatus 的 cls 只有四种，但
+   「暂停 / 禁用 / 登录态失效」在运营上是三件事，分开筛才有用。 */
+function accountBucket(s) {
+  if (s.disabled) return 'disabled';
+  if (s.paused) return 'paused';
+  if (Math.max(Number(s.cooldown_seconds_left || 0), Number(s.breaker_seconds_left || 0)) > 0) return 'cool';
+  if (!s.session_valid) return 'invalid';
+  return 'ok';
+}
+function accMatches(s, q) {
+  if (!q) return true;
+  const hay = [s.name, s.loginid, s.userid, remarkOf(s.name)].filter(Boolean).join(' ').toLowerCase();
+  return hay.includes(q);
+}
+const ACC_SORTS = {
+  cred: (a, b) => Number(b.available || 0) - Number(a.available || 0),
+  err: (a, b) => Number(b.err_total || 0) - Number(a.err_total || 0),
+  recent: (a, b) => Number(b.last_success || 0) - Number(a.last_success || 0),
+  name: (a, b) => String(a.name || '').localeCompare(String(b.name || '')),
+};
+
+/* accRowHtml 单行渲染。抽出来是为了让分页只重算切片，不必改动行内逻辑。 */
+function accRowHtml(s, now, maxCred) {
+  const st = accountStatus(s, now);
+  const err = s.last_error ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.last_error) + '</div>' : '';
+  const locks = modelLocksHtml(s.model_cooldowns, now);
+  const avail = Number(s.available || 0);
+  const pct = Math.min(100, Math.round(avail / maxCred * 100));
+  // 额度口径 tooltip（抓包核对过的三分法）：每日登录后刷新 5000，扣费先活动后长期。
+  let credTip = '可用 ' + fmtPoints(avail);
+  if (s.permanent != null) credTip += '\n长期积分：' + fmtPoints(s.permanent);
+  if (s.daily_balance != null) credTip += '\n每日剩余：' + fmtPoints(s.daily_balance) +
+    (s.daily_quota ? ' / ' + fmtPoints(s.daily_quota) : '');
+  if (s.daily_cycle_date) credTip += '\n每日周期：' + s.daily_cycle_date + (s.checkin_done ? '（已签到）' : '（未签到）');
+  credTip += '\n更新于：' + (s.quota_updated_at ? ago(new Date(s.quota_updated_at * 1000).toISOString()) : '未刷新');
+  const tu = s.token_usage || {};
+  const req = tu.request_count || 0;
+  const latency = fmtMs(tu.last_latency_ms);
+  const rate = fmtRate(tu.last_tokens_per_second);
+  // 参考面板「用量」是累计口径（台账全历史），不是某个时间窗。
+  const usageTitle = '累计：' + req + ' 次 / ' + fmtTok(tu.total_tokens) + ' tok / 均延迟 ' + latency +
+    (rate === '—' ? '' : ' / ' + rate);
+  const days = (s.session_days_left == null) ? '—' : s.session_days_left.toFixed(1) + 'd';
+  return '<tr class="' + st.cls + '" title="' + esc('账号 ' + s.name + (s.userid ? '\nuserid: ' + s.userid : '')) + '">' +
+    '<td class="mark" aria-hidden="true"><i></i></td>' +
+    '<td class="who"><div class="nm">' + remarkName(s.name, esc(s.name || '未命名')) + '</div>' +
+    '<div class="id">' + esc(s.loginid || (s.userid ? 'uid ' + s.userid : '—')) +
+    (s.session_days_left == null ? '' : ' · 登录态 ' + days) + '</div></td>' +
+    '<td>' + st.tag + err + locks + '</td>' +
+    '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + fmtPoints(avail) +
+    (s.permanent != null && s.daily_balance != null
+      ? '<div class="id" style="font-size:11px">长期 ' + fmtPoints(s.permanent) + ' · 每日 ' + fmtPoints(s.daily_balance) + '</div>' : '') +
+    '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
+    '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
+    '<td class="num">' + (s.inflight || 0) + '</td>' +
+    '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line" aria-label="' + esc(usageTitle) + '">' +
+      '<span class="usage-item usage-count"><b>' + req + '</b><em>次</em></span>' +
+      '<span class="usage-item usage-total"><b>' + fmtTok(tu.total_tokens) + '</b><em>tok</em></span>' +
+      '<span class="usage-item usage-latency"><b>' + latency + '</b></span>' +
+      '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
+    '</span></td>' +
+    '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success ? new Date(s.last_success * 1000).toISOString() : '') + '</td>' +
+    '<td class="acts">' +
+      '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.name) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' +
+      '<button class="xs ghost" data-a="balance" data-u="' + esc(s.name) + '">余额</button>' +
+      (s.has_password ? '<button class="xs ghost" data-a="login" data-u="' + esc(s.name) + '">登录</button>' : '') +
+      (s.disabled || s.in_cooldown || s.in_breaker
+        ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.name) + '">解冻</button>'
+        : (s.paused
+          ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.name) + '">恢复选号</button>'
+          : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.name) + '" title="退出选号，但照常签到 / 刷新余额">暂停选号</button>')) +
+      (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.name) + '">禁用</button>') +
+      '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.name) + '">移除</button>' +
+    '</td></tr>';
+}
+
 function renderAccounts(list) {
   const tb = $('accBody');
+  const pager = $('accPager');
   if (!list.length) {
     tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用手机号 + 密码或验证码登录一个 Loomy 账号</div></td></tr>';
+    if (pager) pager.innerHTML = '';
+    $('accFilterNote').textContent = '';
     return;
   }
   const now = Date.now();
-  // 有可用余额 → 进度条按自身 剩余/池内最高；未知 → 空条。
+  const q = accFilter.q.trim().toLowerCase();
+  const filtered = list.filter(s => {
+    if (!accMatches(s, q)) return false;
+    switch (accFilter.state) {
+      case 'ok': return accountBucket(s) === 'ok';
+      case 'cool': return accountBucket(s) === 'cool';
+      case 'paused': return accountBucket(s) === 'paused';
+      case 'disabled': return accountBucket(s) === 'disabled';
+      case 'invalid': return accountBucket(s) === 'invalid';
+      case 'err': return Number(s.err_total || 0) > 0;
+      default: return true;
+    }
+  });
+  const sorter = ACC_SORTS[accFilter.sort];
+  if (sorter) filtered.sort(sorter);
+  const pg = pageSlice(filtered, accFilter);
+  // 进度条基准用「全池最高」而不是当前页最高：翻页时同一账号的条长不该跳变。
   const maxCred = Math.max(1, ...list.map(s => Number(s.available || 0)));
-  tb.innerHTML = list.map(s => {
-    const st = accountStatus(s, now);
-    const err = s.last_error ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.last_error) + '</div>' : '';
-    const locks = modelLocksHtml(s.model_cooldowns, now);
-    const avail = Number(s.available || 0);
-    const pct = Math.min(100, Math.round(avail / maxCred * 100));
-    // 额度口径 tooltip（抓包核对过的三分法）：每日登录后刷新 5000，扣费先活动后长期。
-    let credTip = '可用 ' + fmtPoints(avail);
-    if (s.permanent != null) credTip += '\n长期积分：' + fmtPoints(s.permanent);
-    if (s.daily_balance != null) credTip += '\n每日剩余：' + fmtPoints(s.daily_balance) +
-      (s.daily_quota ? ' / ' + fmtPoints(s.daily_quota) : '');
-    if (s.daily_cycle_date) credTip += '\n每日周期：' + s.daily_cycle_date + (s.checkin_done ? '（已签到）' : '（未签到）');
-    credTip += '\n更新于：' + (s.quota_updated_at ? ago(new Date(s.quota_updated_at * 1000).toISOString()) : '未刷新');
-    const tu = s.token_usage || {};
-    const req = tu.request_count || 0;
-    const latency = fmtMs(tu.last_latency_ms);
-    const rate = fmtRate(tu.last_tokens_per_second);
-    // 参考面板「用量」是累计口径（台账全历史），不是某个时间窗。
-    const usageTitle = '累计：' + req + ' 次 / ' + fmtTok(tu.total_tokens) + ' tok / 均延迟 ' + latency +
-      (rate === '—' ? '' : ' / ' + rate);
-    const days = (s.session_days_left == null) ? '—' : s.session_days_left.toFixed(1) + 'd';
-    return '<tr class="' + st.cls + '" title="' + esc('账号 ' + s.name + (s.userid ? '\nuserid: ' + s.userid : '')) + '">' +
-      '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + remarkName(s.name, esc(s.name || '未命名')) + '</div>' +
-      '<div class="id">' + esc(s.loginid || (s.userid ? 'uid ' + s.userid : '—')) +
-      (s.session_days_left == null ? '' : ' · 登录态 ' + days) + '</div></td>' +
-      '<td>' + st.tag + err + locks + '</td>' +
-      '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + fmtPoints(avail) +
-      (s.permanent != null && s.daily_balance != null
-        ? '<div class="id" style="font-size:11px">长期 ' + fmtPoints(s.permanent) + ' · 每日 ' + fmtPoints(s.daily_balance) + '</div>' : '') +
-      '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
-      '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
-      '<td class="num">' + (s.inflight || 0) + '</td>' +
-      '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line" aria-label="' + esc(usageTitle) + '">' +
-        '<span class="usage-item usage-count"><b>' + req + '</b><em>次</em></span>' +
-        '<span class="usage-item usage-total"><b>' + fmtTok(tu.total_tokens) + '</b><em>tok</em></span>' +
-        '<span class="usage-item usage-latency"><b>' + latency + '</b></span>' +
-        '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
-      '</span></td>' +
-      '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success ? new Date(s.last_success * 1000).toISOString() : '') + '</td>' +
-      '<td class="acts">' +
-        '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.name) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' +
-        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.name) + '">余额</button>' +
-        (s.has_password ? '<button class="xs ghost" data-a="login" data-u="' + esc(s.name) + '">登录</button>' : '') +
-        (s.disabled || s.in_cooldown || s.in_breaker
-          ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.name) + '">解冻</button>'
-          : (s.paused
-            ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.name) + '">恢复选号</button>'
-            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.name) + '" title="退出选号，但照常签到 / 刷新余额">暂停选号</button>')) +
-        (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.name) + '">禁用</button>') +
-        '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.name) + '">移除</button>' +
-      '</td></tr>';
-  }).join('');
+  tb.innerHTML = pg.rows.length
+    ? pg.rows.map(s => accRowHtml(s, now, maxCred)).join('')
+    : '<tr><td colspan="9"><div class="empty">没有符合筛选条件的账号</div></td></tr>';
+  $('accFilterNote').textContent = filtered.length === list.length
+    ? list.length + ' 个账号'
+    : '筛选 ' + filtered.length + ' / ' + list.length;
+  renderPager('accPager', pg, accFilter, () => renderAccounts(list));
 }
 
 // 模型锁池：账号池回答「哪些号不能用」，这张表回答「哪些模型不能用、还要锁多久」。
@@ -580,6 +680,20 @@ $('accBody').addEventListener('click', async ev => {
     loadOverview(true);
   }
 });
+
+/* 账号池筛选：输入即时过滤（121 行量级，直接重渲染比防抖更简单也更跟手）。 */
+function rerenderAccounts() {
+  renderAccounts((overviewData && overviewData.accounts) || []);
+}
+$('accQ').addEventListener('input', () => { accFilter.q = $('accQ').value; accFilter.page = 1; rerenderAccounts(); });
+$('accState').onchange = () => { accFilter.state = $('accState').value; accFilter.page = 1; rerenderAccounts(); };
+$('accSort').onchange = () => { accFilter.sort = $('accSort').value; accFilter.page = 1; rerenderAccounts(); };
+$('accSize').onchange = () => { accFilter.size = Number($('accSize').value) || 20; accFilter.page = 1; rerenderAccounts(); };
+$('accReset').onclick = () => {
+  accFilter = { q: '', state: '', sort: 'default', page: 1, size: accFilter.size };
+  $('accQ').value = ''; $('accState').value = ''; $('accSort').value = 'default';
+  rerenderAccounts();
+};
 
 $('btnCheckinAll').onclick = async () => {
   const btn = $('btnCheckinAll');
@@ -1365,6 +1479,35 @@ $('btnRefresh').onclick = async () => {
   if (view === 'logs') loadLogs();
 };
 
+/* ── 折叠区块 ─────────────────────────────────────────────────────── */
+/* 次要区块（模型锁池 / 已下架 / 按小时）默认收起，把首屏让给账号池和用量明细；
+   状态写 localStorage，刷新与切页都保持。 */
+const LS_FOLD = 'loomy2api.folds';
+const FOLD_DEFAULT = { expiry: true, modellocks: true, deadmodels: true, hourly: true };
+function foldState() {
+  try { return Object.assign({}, FOLD_DEFAULT, JSON.parse(localStorage.getItem(LS_FOLD) || '{}')); }
+  catch (_) { return Object.assign({}, FOLD_DEFAULT); }
+}
+function applyFolds() {
+  const st = foldState();
+  document.querySelectorAll('button[data-fold]').forEach(b => {
+    const on = !!st[b.dataset.fold];
+    const box = b.closest('.box');
+    if (box) box.classList.toggle('folded', on);
+    b.textContent = on ? '展开' : '收起';
+    b.setAttribute('aria-expanded', String(!on));
+  });
+}
+document.querySelectorAll('button[data-fold]').forEach(b => {
+  b.addEventListener('click', () => {
+    const st = foldState();
+    st[b.dataset.fold] = !st[b.dataset.fold];
+    localStorage.setItem(LS_FOLD, JSON.stringify(st));
+    applyFolds();
+  });
+});
+applyFolds();
+
 /* ── 轮询 ─────────────────────────────────────────────────────────── */
 function refreshVisible() {
   if (view === 'accounts') loadOverview(true);
@@ -1534,13 +1677,18 @@ const US_DIM_TABS = [['account', '按账号'], ['model', '按模型']];
 function renderUsageDim() {
   const d = usageData || {};
   const m = US_DIMS[usDim] || US_DIMS.account;
-  const rows = usSortRows(d[m.key] || [], usSort);
+  const q = usDimFilter.q.trim().toLowerCase();
+  const all = usSortRows(d[m.key] || [], usSort);
+  const rows = q
+    ? all.filter(x => (String(x.key || '') + ' ' + remarkOf(x.key)).toLowerCase().includes(q))
+    : all;
+  const pg = pageSlice(rows, usDimFilter);
   $('usDimTabs').innerHTML = usTabsHtml(US_DIM_TABS, usDim, {
     account: (d.by_account || []).length,
     model: (d.by_model || []).length,
   });
   $('usDimHead').innerHTML = usDimHead(usDim);
-  $('usDimBody').innerHTML = rows.map(x =>
+  $('usDimBody').innerHTML = pg.rows.map(x =>
     '<tr><td class="mark" aria-hidden="true"></td>' +
     '<td>' + remarkName(x.key, esc(x.key || '—')) + '</td>' +
     '<td class="num">' + fmtTok(x.requests) + '</td>' +
@@ -1551,8 +1699,11 @@ function renderUsageDim() {
     '<td class="num">' + fmtPoints(x.points) + '</td>' +
     (m.withPerf ? '<td class="num">' + fmtMs(x.avg_latency_ms) + '</td>' : '') +
     '</tr>'
-  ).join('') || '<tr><td colspan="' + m.span + '" class="empty">暂无数据</td></tr>';
+  ).join('') || '<tr><td colspan="' + m.span + '" class="empty">' +
+    (q ? '没有匹配「' + esc(usDimFilter.q) + '」的' + esc(m.title) : '暂无数据') + '</td></tr>';
   $('usDimNote').textContent = rows.length + ' 行 · 请求数含失败尝试';
+  if ($('usFilterNote')) $('usFilterNote').textContent = q ? '筛选 ' + rows.length + ' / ' + all.length : '';
+  renderPager('usDimPager', pg, usDimFilter, renderUsageDim);
 }
 $('usDimTabs').addEventListener('click', ev => {
   const b = ev.target.closest('button[data-dim]');
@@ -1561,22 +1712,26 @@ $('usDimTabs').addEventListener('click', ev => {
   renderUsageDim();
 });
 $('usSort').onchange = () => { usSort = $('usSort').value; renderUsageDim(); };
+$('usQ').addEventListener('input', () => { usDimFilter.q = $('usQ').value; usDimFilter.page = 1; renderUsageDim(); });
+$('usSize').onchange = () => { usDimFilter.size = Number($('usSize').value) || 20; usDimFilter.page = 1; renderUsageDim(); };
+$('usCreditSize').onchange = () => { usCreditFilter.size = Number($('usCreditSize').value) || 20; usCreditFilter.page = 1; renderCreditDim(); };
 
 /* ── 积分扣除维度（按账号/按模型；数据同 usage 响应，Loomy 里 points 即积分）── */
 function renderCreditDim() {
   const d = usageData || {};
   const dimKey = usCreditDim === 'model' ? 'by_model' : 'by_account';
-  const rows = (d[dimKey] || []).filter(x => Number(x.points || 0) > 0);
-  const tokSum = rows.reduce((n, x) => n + Number(x.total_tokens || 0), 0);
-  const ptSum = rows.reduce((n, x) => n + Number(x.points || 0), 0);
+  const all = (d[dimKey] || []).filter(x => Number(x.points || 0) > 0);
+  const pg = pageSlice(all, usCreditFilter);
+  const tokSum = all.reduce((n, x) => n + Number(x.total_tokens || 0), 0);
+  const ptSum = all.reduce((n, x) => n + Number(x.points || 0), 0);
   $('usCreditStats').innerHTML =
     usKpi(fmtPoints(ptSum), '消耗积分', 'c-accent', '台账观测值') +
     usKpi(fmtTok(tokSum), '匹配 Token', 'c-mute', '与积分同时观测') +
     usKpi(tokSum ? trimFixed((ptSum / tokSum * 1e6).toFixed(2)) + ' / 1M' : '—', '平均积分 / 1M Token', 'c-ok', '越低越划算') +
-    usKpi(String(rows.length), '有扣费口径', 'c-mute', usCreditDim === 'model' ? '个模型' : '个账号');
+    usKpi(String(all.length), '有扣费口径', 'c-mute', usCreditDim === 'model' ? '个模型' : '个账号');
   $('usCreditHead').innerHTML = '<tr><th class="mark" aria-hidden="true"></th><th>' +
     (usCreditDim === 'model' ? '模型' : '账号') + '</th><th class="num">请求</th><th class="num">扣除积分</th><th class="num">Token</th><th class="num">积分 / 1M Token</th></tr>';
-  $('usCreditBody').innerHTML = rows.map(x =>
+  $('usCreditBody').innerHTML = pg.rows.map(x =>
     '<tr><td class="mark" aria-hidden="true"></td>' +
     '<td>' + remarkName(x.key, esc(x.key || '—')) + '</td>' +
     '<td class="num">' + fmtTok(x.requests) + '</td>' +
@@ -1589,6 +1744,7 @@ function renderCreditDim() {
     account: (d.by_account || []).filter(x => Number(x.points || 0) > 0).length,
     model: (d.by_model || []).filter(x => Number(x.points || 0) > 0).length,
   });
+  renderPager('usCreditPager', pg, usCreditFilter, renderCreditDim);
 }
 $('usCreditTabs').addEventListener('click', ev => {
   const b = ev.target.closest('button[data-dim]');

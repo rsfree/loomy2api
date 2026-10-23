@@ -593,6 +593,24 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .fbar .grow { flex: 1; }
   .fbar .flab { color: var(--ink-3); font-size: 12px; white-space: nowrap; }
   .fbar select { cursor: pointer; }
+  /* 折叠区块：header 右侧 .fold 按钮翻转 .box.folded，正文整体收起。
+     状态存 localStorage（loomy2api.folds），刷新后保持。 */
+  .box.folded > :not(header) { display: none; }
+  .box > header .fold { flex: none; }
+  /* 分页条：信息在左、页码在右，和表头同一视觉层级。 */
+  .pager { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    padding: 10px 17px; border-top: 1px solid var(--line-soft); }
+  .pager .info { color: var(--ink-3); font-size: 12px; margin-right: auto; }
+  .pager .gap { color: var(--ink-3); font-size: 12px; }
+  .pager button { min-width: 30px; }
+  .pager button[disabled] { opacity: .45; cursor: default; }
+  /* 账号表操作列在宽屏吸右：表格比窗口宽时，滚动不再把「签到/禁用/移除」推走。
+     行背景显式设成 surface，td.acts 用 inherit 才能跟着 hover 一起变色。 */
+  @media (min-width: 1000px) {
+    #view-accounts .acc tbody tr { background: var(--surface); }
+    #view-accounts .acc th.c-acts { position: sticky; right: 0; background: var(--surface); border-left: 1px solid var(--line-soft); }
+    #view-accounts .acc td.acts { position: sticky; right: 0; background: inherit; border-left: 1px solid var(--line-soft); }
+  }
   /* 用量总览的头部在「自定义」态会多出两个时间输入框：允许换行，宁可整组折到
      下一行，也不要把标题挤成两行、把下拉压成窄条。
      口径说明（#usNote）单行截断而不是折行——它是长文本，一旦允许折行就会在窄屏
@@ -742,25 +760,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余</div></div>
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
       </div>
-      <!-- 到期提醒：数据取自 /overview 的账号额度快照（daily_balance + daily_cycle_date），
-           打开页面零上游请求。Loomy 的每日赠送额度随周期滚存失效，长期积分不到期。 -->
-      <div class="box">
-        <header>
-          <h3>积分到期提醒 <span class="hint">按自然日聚合 · 日均需耗 = 该日到期积分 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）</span></h3>
-          <span class="grow"></span>
-          <span class="note" id="expNote"></span>
-        </header>
-        <div class="tbl-wrap">
-        <table class="acc">
-          <thead><tr>
-            <th>账号</th><th>最近到期</th><th class="num">距到期</th>
-            <th class="num">该日到期</th><th class="num">日均需耗</th>
-          </tr></thead>
-          <tbody id="expBody"></tbody>
-        </table>
-        </div>
-      </div>
-
       <div class="box">
         <header>
           <h3>账号池 <span class="hint">登录成功自动签到领每日积分 · 每日周期上游自动刷新</span></h3>
@@ -771,6 +770,31 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs" id="btnOnboardingAll" title="领新手任务：8 项合计 10000 积分，服务端不校验前置行为，零 token 消耗">领新手任务</button>
           <button class="xs" id="btnRefreshAll">全部刷新额度</button>
         </header>
+        <div class="fbar" id="accFilter">
+          <input id="accQ" type="search" placeholder="搜索手机号 / userid / 备注" aria-label="搜索账号">
+          <select id="accState" aria-label="按状态筛选">
+            <option value="">全部状态</option>
+            <option value="ok">可用</option>
+            <option value="cool">冷却中</option>
+            <option value="paused">暂停选号</option>
+            <option value="disabled">已禁用</option>
+            <option value="invalid">登录态失效</option>
+            <option value="err">有失败记录</option>
+          </select>
+          <select id="accSort" aria-label="排序方式">
+            <option value="default">默认顺序</option>
+            <option value="cred">积分 高 → 低</option>
+            <option value="err">失败次数 多 → 少</option>
+            <option value="recent">最近成功 新 → 旧</option>
+            <option value="name">账号名 A → Z</option>
+          </select>
+          <label class="sel-note">每页
+            <select id="accSize"><option value="20">20</option><option value="50">50</option><option value="100">100</option></select>
+          </label>
+          <span class="grow"></span>
+          <span class="note" id="accFilterNote"></span>
+          <button class="xs ghost" id="accReset">重置</button>
+        </div>
         <div class="tbl-wrap">
         <table class="acc">
           <thead><tr>
@@ -781,6 +805,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <tbody id="accBody"></tbody>
         </table>
         </div>
+        <div class="pager" id="accPager"></div>
       </div>
 
       <!-- 模型锁池：账号池回答「哪些号不能用」，这张表回答「哪些模型不能用、还要锁多久」。
@@ -790,6 +815,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <h3>模型锁池 <span class="hint">哪些模型不能用、还要锁多久</span></h3>
           <span class="grow"></span>
           <span class="note" id="mlNote"></span>
+          <button class="xs ghost fold" data-fold="modellocks" aria-expanded="true">收起</button>
         </header>
         <div class="tbl-wrap">
         <table class="acc">
@@ -809,6 +835,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <h3>已下架模型 <span class="hint">上游 404 判定的失效模型，期间从模型列表隐藏、请求直接 404</span></h3>
           <span class="grow"></span>
           <span class="note" id="dmNote"></span>
+          <button class="xs ghost fold" data-fold="deadmodels" aria-expanded="true">收起</button>
         </header>
         <div class="tbl-wrap">
         <table class="acc">
@@ -819,6 +846,27 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </table>
         </div>
       </div>
+
+      <!-- 到期提醒：数据取自 /overview 的账号额度快照（daily_balance + daily_cycle_date），
+           打开页面零上游请求。Loomy 的每日赠送额度随周期滚存失效，长期积分不到期。 -->
+      <div class="box">
+        <header>
+          <h3>积分到期提醒 <span class="hint">按自然日聚合 · 日均需耗 = 该日到期积分 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="expNote"></span>
+          <button class="xs ghost fold" data-fold="expiry" aria-expanded="true">收起</button>
+        </header>
+        <div class="tbl-wrap">
+        <table class="acc">
+          <thead><tr>
+            <th>账号</th><th>最近到期</th><th class="num">距到期</th>
+            <th class="num">该日到期</th><th class="num">日均需耗</th>
+          </tr></thead>
+          <tbody id="expBody"></tbody>
+        </table>
+        </div>
+      </div>
+
     </section>
 
     <!-- 模型与档位 -->
@@ -960,7 +1008,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
       <div class="box">
         <header><h3>积分与 token 按小时</h3><span class="grow"></span>
-          <span class="note">token 取网关台账 usage；积分取上游 usage.points_consumed（观测到的请求才计）</span></header>
+          <span class="note">token 取网关台账 usage；积分取上游 usage.points_consumed（观测到的请求才计）</span>
+          <button class="xs ghost fold" data-fold="hourly" aria-expanded="true">收起</button></header>
         <div class="tbl-wrap">
           <table class="acc">
             <thead><tr>
@@ -991,12 +1040,21 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             </select>
           </label>
         </header>
+        <div class="fbar" id="usFilter">
+          <input id="usQ" type="search" placeholder="搜索账号 / 模型" aria-label="搜索用量明细">
+          <label class="sel-note">每页
+            <select id="usSize"><option value="20">20</option><option value="50">50</option><option value="100">100</option></select>
+          </label>
+          <span class="grow"></span>
+          <span class="note" id="usFilterNote"></span>
+        </div>
         <div class="tbl-wrap">
           <table class="acc zebra">
             <thead id="usDimHead"></thead>
             <tbody id="usDimBody"></tbody>
           </table>
         </div>
+        <div class="pager" id="usDimPager"></div>
       </div>
 
       <div class="box">
@@ -1007,6 +1065,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <button data-dim="model">按模型</button>
           </span>
           <span class="grow"></span>
+          <label class="sel-note">每页
+            <select id="usCreditSize"><option value="20">20</option><option value="50">50</option><option value="100">100</option></select>
+          </label>
           <span class="note" id="usCreditNote">台账观测值</span>
         </header>
         <div class="kpis" id="usCreditStats"></div>
@@ -1016,6 +1077,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <tbody id="usCreditBody"></tbody>
           </table>
         </div>
+        <div class="pager" id="usCreditPager"></div>
       </div>
     </section>
 
