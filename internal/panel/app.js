@@ -768,7 +768,18 @@ function renderTasks(d) {
   $('tkClaimable').textContent = fmtPoints(sum.claimable || 0);
   $('tkTotal').textContent = fmtPoints(totalPts);
   $('tkRate').textContent = (sum.tasks_total ? Math.round(sum.tasks_done / sum.tasks_total * 100) : 0) + '%';
-  $('tkNote').textContent = sum.queryable ? '可查询账号 ' + sum.queryable + ' 个' : '没有可查询的账号';
+  // 自动补领状态：新手任务原先只在登录/手动签到时领一次，单项失败会让该号
+  // 永久停在 5/8、7/8；后台现在每 N 小时补一轮，这里把节奏与上次时间显示出来。
+  const auto = d.auto || {};
+  let tkNote = sum.queryable ? '可查询账号 ' + sum.queryable + ' 个' : '没有可查询的账号';
+  if (auto.enabled) {
+    tkNote += ' · 自动补领每 ' + auto.interval_hours + ' 小时';
+    if (auto.last_run) {
+      const t = new Date(auto.last_run);
+      tkNote += '（上次 ' + t.toLocaleTimeString('zh-CN', { hour12: false }).slice(0, 5) + '）';
+    }
+  }
+  $('tkNote').textContent = tkNote;
 
   const body = $('tkBody');
   if (!rows.length) {

@@ -131,9 +131,15 @@ type Config struct {
 	SessionRenewDays int    `json:"session_renew_before_days"`
 	// AutoRelogin 登录态剩余不足 SessionRenewDays 天时，用手机号 + 密码自动重登，
 	// 把 14 天有效期滚动续上（只对有密码的账号生效；上游没有 refresh token）。
-	AutoRelogin         bool `json:"auto_relogin"`
-	QuotaRefreshMinutes int  `json:"quota_refresh_minutes"`
-	BalanceFloor        int  `json:"balance_floor"` // 可用积分低于此值停止接单（0=关闭）
+	AutoRelogin bool `json:"auto_relogin"`
+	// OnboardingAuto 周期补领新手任务（8 项合计 10000 积分，纯 API 直领、零 token、幂等）。
+	// 为什么需要：ClaimOnboarding 对单个任务的失败是「跳过、不放弃其余」——一次瞬时
+	// 失败会让该号永久停在 5/8、7/8，而它原先只在登录与手动签到时被调用。
+	OnboardingAuto bool `json:"onboarding_auto"`
+	// OnboardingIntervalHours 补领间隔（小时）。<=0 用默认 6 小时。
+	OnboardingIntervalHours int `json:"onboarding_interval_hours"`
+	QuotaRefreshMinutes     int `json:"quota_refresh_minutes"`
+	BalanceFloor            int `json:"balance_floor"` // 可用积分低于此值停止接单（0=关闭）
 	// PreferDaily 选号优先花「今日赠送额度」（按自然日清零），再动永久积分。
 	// 上游不会因赠送额度耗尽报错（静默改扣永久积分、照常 200），只能靠排序实现。
 	PreferDaily bool `json:"prefer_daily_quota"`
@@ -187,23 +193,25 @@ func Defaults() *Config {
 		BreakerBaseSeconds:  60,
 		BreakerMaxSeconds:   1800,
 
-		Strategy:            "weighted",
-		PickTopN:            5,
-		StickyTTLSeconds:    1800,
-		StickyMaxEntries:    2000,
-		SessionRenewDays:    3,
-		AutoRelogin:         true,
-		QuotaRefreshMinutes: 30,
-		BalanceFloor:        0,
-		PreferDaily:         true,
-		StrictModelCheck:    true,
-		Egress:              egress.Config{Mode: egress.ModeDirect},
-		DeadModelTTLDays:    30,
-		UsageMaxEntries:     20000,
-		LogRequests:         true,
-		SendClientInfo:      true,
-		IdentityMode:        "per_account",
-		SessionsFromClient:  true,
+		Strategy:                "weighted",
+		PickTopN:                5,
+		StickyTTLSeconds:        1800,
+		StickyMaxEntries:        2000,
+		SessionRenewDays:        3,
+		AutoRelogin:             true,
+		OnboardingAuto:          true,
+		OnboardingIntervalHours: 6,
+		QuotaRefreshMinutes:     30,
+		BalanceFloor:            0,
+		PreferDaily:             true,
+		StrictModelCheck:        true,
+		Egress:                  egress.Config{Mode: egress.ModeDirect},
+		DeadModelTTLDays:        30,
+		UsageMaxEntries:         20000,
+		LogRequests:             true,
+		SendClientInfo:          true,
+		IdentityMode:            "per_account",
+		SessionsFromClient:      true,
 	}
 }
 

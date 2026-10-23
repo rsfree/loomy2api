@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -979,5 +980,86 @@ func TestCreditHistoryMarksPartial(t *testing.T) {
 	}
 	if out["partial"] != true {
 		t.Errorf("上游全失败时应标 partial=true，实际 %v", out["partial"])
+	}
+}
+
+// TestAutoOnboardingClaimsIncomplete 自动补领只对「缺项」的账号发 complete：
+// 已领满的号只多一次 GET（幂等，不重复加分），禁用/暂停的号整轮跳过。
+// 这条链路原先不存在——新手任务只在登录与手动签到时领一次，单项失败会让
+// 账号永久停在 5/8、7/8（线上任务中心截图里的「部分」）。
+func TestAutoOnboardingClaimsIncomplete(t *testing.T) {
+	var mu sync.Mutex
+	claims := map[string]int{}
+	done := func(keys ...string) map[string]bool {
+		out := make(map[string]bool, len(upstream.OnboardingPoints))
+		for k := range upstream.OnboardingPoints {
+			out[k] = false
+		}
+		for _, k := range keys {
+			out[k] = true
+		}
+		return out
+	}
+	allDone := done("first_message", "pick_skill", "generate_ppt", "set_schedule",
+		"install_skill", "configure_remote", "create_soul", "share_soul")
+	state := map[string]map[string]bool{
+		"sess-1":    allDone, // newTestPanelUpstream 预置的 acc1
+		"sess-full": allDone,
+		"sess-part": done("first_message"),
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sess := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if strings.HasSuffix(r.URL.Path, "/onboarding/tasks/complete") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			key, _ := body["key"].(string)
+			mu.Lock()
+			claims[sess+"|"+key]++
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{"code":"000000","data":{"alreadyCompleted":false,"balance":10000}}`)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/onboarding/tasks") {
+			tasks := state[sess]
+			if tasks == nil {
+				tasks = done()
+			}
+			buf, _ := json.Marshal(map[string]any{"code": "000000", "data": map[string]any{
+				"tasks": tasks, "earned": 0, "total": upstream.OnboardingTotal,
+			}})
+			_, _ = w.Write(buf)
+			return
+		}
+		_, _ = io.WriteString(w, `{"code":"000000","data":{}}`)
+	}))
+	defer srv.Close()
+
+	pl, p := newTestPanelUpstream(t, srv.URL)
+	expire := time.Now().Add(48 * time.Hour).Unix()
+	p.Add(&pool.Account{Name: "acc-full", Enabled: true, Session: "sess-full", ExpireAt: expire})
+	p.Add(&pool.Account{Name: "acc-part", Enabled: true, Session: "sess-part", ExpireAt: expire})
+	p.Add(&pool.Account{Name: "acc-off", Enabled: false, Session: "sess-off", ExpireAt: expire})
+
+	n, pts := pl.AutoOnboarding(context.Background())
+	if n != 1 {
+		t.Errorf("应只有 1 个账号到账，实际 %d", n)
+	}
+	want := upstream.OnboardingTotal - upstream.OnboardingPoints["first_message"]
+	if pts != want {
+		t.Errorf("到账积分 %d，期望 %d（7 个缺项）", pts, want)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for key := range claims {
+		if strings.HasPrefix(key, "sess-full|") {
+			t.Errorf("已领满的账号不该再发 complete：%s", key)
+		}
+		if strings.HasPrefix(key, "sess-off|") {
+			t.Errorf("禁用账号不该被领取：%s", key)
+		}
+	}
+	if len(claims) != 7 {
+		t.Errorf("应为缺的 7 项各发一次，实际 %d 次", len(claims))
 	}
 }

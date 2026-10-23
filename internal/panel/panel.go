@@ -60,6 +60,10 @@ type Panel struct {
 	creditAll  []creditEntry
 	creditPart bool
 
+	// 新手任务自动补领的最近完成时间（任务中心展示 + 判断间隔）。
+	onboardMu   sync.Mutex
+	onboardLast time.Time
+
 	started time.Time
 }
 

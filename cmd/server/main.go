@@ -164,6 +164,14 @@ func main() {
 func background(cfg *config.Config, p *pool.Pool, up *upstream.Client, pl *panel.Panel, stop <-chan struct{}) {
 	quota := time.NewTicker(time.Duration(maxInt(cfg.QuotaRefreshMinutes, 1)) * time.Minute)
 	defer quota.Stop()
+	// 新手任务补领：启动 90s 后先跑一轮（刚导入的号不用等一个周期），
+	// 之后挂在额度 ticker 上，按 onboarding_interval_hours 节流。
+	onboardEvery := time.Duration(maxInt(cfg.OnboardingIntervalHours, 1)) * time.Hour
+	lastOnboard := time.Now()
+	var firstOnboard <-chan time.Time
+	if cfg.OnboardingAuto {
+		firstOnboard = time.After(90 * time.Second)
+	}
 	gc := time.NewTicker(5 * time.Minute)
 	defer gc.Stop()
 	// expiredWarned 记录每个账号最近一次登录态告警日期，避免同一账号反复刷屏。
@@ -204,9 +212,27 @@ func background(cfg *config.Config, p *pool.Pool, up *upstream.Client, pl *panel
 			if ok, bad := pl.AutoRenew(time.Now()); ok+bad > 0 {
 				log.Printf("登录态自动续期：成功 %d，失败 %d", ok, bad)
 			}
+		case <-firstOnboard:
+			runOnboarding(pl)
+			lastOnboard = time.Now()
+			firstOnboard = nil // nil channel 在 select 里永久阻塞 = 只跑一次
 		case <-quota.C:
 			refreshQuotas(p, up)
+			if cfg.OnboardingAuto && time.Since(lastOnboard) >= onboardEvery {
+				runOnboarding(pl)
+				lastOnboard = time.Now()
+			}
 		}
+	}
+}
+
+// runOnboarding 跑一轮新手任务补领，只打印真正有到账的那一轮。
+func runOnboarding(pl *panel.Panel) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	n, pts := pl.AutoOnboarding(ctx)
+	if n > 0 {
+		log.Printf("新手任务自动补领：%d 个账号到账 %d 积分", n, pts)
 	}
 }
 

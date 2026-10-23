@@ -496,3 +496,14 @@ func TestSaveOnlyReportsChangedRestartKeys(t *testing.T) {
 		t.Errorf("真改了的 listen 应上报，实际 %v", restart)
 	}
 }
+
+// TestOnboardingDefaults 新手任务自动补领默认开启、间隔 6 小时。
+func TestOnboardingDefaults(t *testing.T) {
+	c := Defaults()
+	if !c.OnboardingAuto {
+		t.Error("onboarding_auto 默认应为 true")
+	}
+	if c.OnboardingIntervalHours != 6 {
+		t.Errorf("onboarding_interval_hours = %d，期望 6", c.OnboardingIntervalHours)
+	}
+}

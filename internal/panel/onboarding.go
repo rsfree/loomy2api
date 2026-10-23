@@ -56,6 +56,65 @@ func onboardingCatalog() []onboardingTaskMeta {
 	return out
 }
 
+// AutoOnboarding 周期补领新手任务（幂等）。
+//
+// 只处理「启用 + 未暂停 + 登录态有效」的账号；与手动操作互斥（TryLock 失败即跳过，
+// 下一轮再来）。已领满的号只多一次 GET——ClaimOnboarding 先查状态再补发。
+// 返回本次真正到账的账号数与积分。
+func (p *Panel) AutoOnboarding(ctx context.Context) (accounts int, points int64) {
+	var (
+		wg  sync.WaitGroup
+		mu  sync.Mutex
+		sem = make(chan struct{}, 4)
+	)
+	for _, a := range p.pool.All() {
+		if !a.Enabled || a.Paused || !a.SessionValid() {
+			continue
+		}
+		wg.Add(1)
+		go func(a *pool.Account) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if !p.tryLock(a.Name) {
+				return // 正在登录/签到/手动领取，交给下一轮
+			}
+			defer p.unlock(a.Name)
+			cctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+			defer cancel()
+			_, pts, err := p.claimOnboardingCtx(cctx, a)
+			if err != nil || pts <= 0 {
+				return
+			}
+			mu.Lock()
+			accounts++
+			points += pts
+			mu.Unlock()
+		}(a)
+	}
+	wg.Wait()
+	p.onboardMu.Lock()
+	p.onboardLast = time.Now()
+	p.onboardMu.Unlock()
+	return accounts, points
+}
+
+// onboardingAutoInfo 任务中心的「自动补领」状态（面板展示用）。
+func (p *Panel) onboardingAutoInfo() map[string]any {
+	interval := p.cfg.OnboardingIntervalHours
+	if interval <= 0 {
+		interval = 6
+	}
+	p.onboardMu.Lock()
+	last := p.onboardLast
+	p.onboardMu.Unlock()
+	out := map[string]any{"enabled": p.cfg.OnboardingAuto, "interval_hours": interval}
+	if !last.IsZero() {
+		out["last_run"] = last.Format(time.RFC3339)
+	}
+	return out
+}
+
 // onboardingMatrix GET /panel/api/onboarding：全池新手任务状态矩阵。
 //
 // 只读：不改账号状态、不领任务，因此可以随时刷新。并发 4 路查询上游，
@@ -142,6 +201,7 @@ func (p *Panel) onboardingMatrix(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"tasks":    catalog,
 		"total":    upstream.OnboardingTotal,
+		"auto":     p.onboardingAutoInfo(),
 		"accounts": rows,
 		"summary": map[string]any{
 			"accounts":    len(rows),
