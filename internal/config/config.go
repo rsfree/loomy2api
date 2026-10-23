@@ -100,7 +100,11 @@ type Config struct {
 	ImageFallbackModel string `json:"image_fallback_model"`
 	StripPrefix        bool   `json:"strip_model_prefix"`
 	TimeoutSecond      int    `json:"timeout_seconds"`
-	MaxRetries         int    `json:"max_retries"`
+	// ImageDeadlineSecond 单次生图请求的总时限（跨账号/跨精简重试）。
+	// 上游拥塞时单次就可能耗 300s，再重试会把请求拖到 15 分钟（实测 900s），
+	// 因此在这里兜一个总预算，超了就把最后一个错误尽快还给调用方。
+	ImageDeadlineSecond int `json:"image_deadline_seconds"`
+	MaxRetries          int `json:"max_retries"`
 	// 非流式且 max_tokens ≥ 该值时，内部改走流式再聚合：上游对长时间无响应的
 	// 非流式请求约 60s 就回 504，流式同模型能跑几分钟。
 	KeepaliveMinTokens int `json:"keepalive_min_tokens"`
@@ -160,11 +164,12 @@ func Defaults() *Config {
 		AccountAppID: DefaultAccountApp,
 		LoomyVersion: DefaultLoomyVersion,
 
-		DefaultModel:       "imodel/deepseek-v4-flash-0731",
-		ImageFallbackModel: "doubao-seedream-5-lite",
-		StripPrefix:        true,
-		TimeoutSecond:      3600,
-		MaxRetries:         2,
+		DefaultModel:        "imodel/deepseek-v4-flash-0731",
+		ImageFallbackModel:  "doubao-seedream-5-lite",
+		StripPrefix:         true,
+		TimeoutSecond:       3600,
+		ImageDeadlineSecond: 420,
+		MaxRetries:          2,
 
 		KeepaliveMinTokens: 1500,
 
@@ -262,25 +267,26 @@ func mergeJSON(cfg *Config, raw map[string]any) error {
 }
 
 var envMap = map[string]string{
-	"LOOMY_LISTEN":          "listen",
-	"LOOMY_API_KEYS":        "api_keys",
-	"LOOMY_AUTH_DIR":        "auth_dir",
-	"LOOMY_STATE_FILE":      "state_file",
-	"LOOMY_UPSTREAM":        "upstream",
-	"LOOMY_ACCOUNT_BASE":    "account_base",
-	"LOOMY_AK_ID":           "access_key_id",
-	"LOOMY_AK_SECRET":       "access_key_secret",
-	"LOOMY_LOOMY_VERSION":   "loomy_version",
-	"LOOMY_PROXY":           "proxy",
-	"LOOMY_DEFAULT_MODEL":   "default_model",
-	"LOOMY_STRATEGY":        "strategy",
-	"LOOMY_PICK_TOP_N":      "pick_top_n",
-	"LOOMY_MAX_INFLIGHT":    "max_inflight_per_account",
-	"LOOMY_STICKY_TTL":      "sticky_ttl_seconds",
-	"LOOMY_BALANCE_FLOOR":   "balance_floor",
-	"LOOMY_LOG_REQUESTS":    "log_requests",
-	"LOOMY_TIMEOUT_SECONDS": "timeout_seconds",
-	"LOOMY_PANEL_OFF":       "", // 占位：不接受
+	"LOOMY_LISTEN":                 "listen",
+	"LOOMY_API_KEYS":               "api_keys",
+	"LOOMY_AUTH_DIR":               "auth_dir",
+	"LOOMY_STATE_FILE":             "state_file",
+	"LOOMY_UPSTREAM":               "upstream",
+	"LOOMY_ACCOUNT_BASE":           "account_base",
+	"LOOMY_AK_ID":                  "access_key_id",
+	"LOOMY_AK_SECRET":              "access_key_secret",
+	"LOOMY_LOOMY_VERSION":          "loomy_version",
+	"LOOMY_PROXY":                  "proxy",
+	"LOOMY_DEFAULT_MODEL":          "default_model",
+	"LOOMY_STRATEGY":               "strategy",
+	"LOOMY_PICK_TOP_N":             "pick_top_n",
+	"LOOMY_MAX_INFLIGHT":           "max_inflight_per_account",
+	"LOOMY_STICKY_TTL":             "sticky_ttl_seconds",
+	"LOOMY_BALANCE_FLOOR":          "balance_floor",
+	"LOOMY_LOG_REQUESTS":           "log_requests",
+	"LOOMY_TIMEOUT_SECONDS":        "timeout_seconds",
+	"LOOMY_IMAGE_DEADLINE_SECONDS": "image_deadline_seconds",
+	"LOOMY_PANEL_OFF":              "", // 占位：不接受
 }
 
 func (c *Config) applyEnv() {
@@ -365,6 +371,9 @@ func (c *Config) normalize() {
 	}
 	if c.MaxRetries < 0 {
 		c.MaxRetries = 0
+	}
+	if c.ImageDeadlineSecond <= 0 {
+		c.ImageDeadlineSecond = 420
 	}
 	if c.TimeoutSecond <= 0 {
 		c.TimeoutSecond = 3600

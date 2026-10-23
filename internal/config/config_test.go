@@ -111,6 +111,9 @@ func TestNormalizeFixesIllegalValues(t *testing.T) {
 	if cfg.MaxRetries < 0 {
 		t.Error("max_retries 不应为负")
 	}
+	if cfg.ImageDeadlineSecond <= 0 {
+		t.Errorf("image_deadline_seconds = %d", cfg.ImageDeadlineSecond)
+	}
 	if cfg.TimeoutSecond <= 0 {
 		t.Error("timeout_seconds 应被修正")
 	}

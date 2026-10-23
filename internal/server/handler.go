@@ -1004,11 +1004,28 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 		}
 
 		started := time.Now()
+		// 生图总预算：上游拥塞时单次尝试就可能耗 300s，再叠加换号/精简重试会把
+		// 一次请求拖到 15 分钟（实测 900s 的 400/502）。超预算就把最后的错误
+		// 尽快还给调用方，并用 Retry-After 提示重试节奏。
+		deadline := time.Time{}
+		if kind == "image" {
+			budget := time.Duration(h.Cfg.ImageDeadlineSecond) * time.Second
+			if h.Cfg.ImageDeadlineSecond <= 0 {
+				budget = 420 * time.Second
+			}
+			deadline = started.Add(budget)
+		}
 		var tried []string
 		var lastAcc *pool.Account
 		var lastStatus int
 		var lastBody string
 		for attempt := 0; attempt <= h.Cfg.MaxRetries; attempt++ {
+			if !deadline.IsZero() && !time.Now().Before(deadline) {
+				lastStatus = http.StatusGatewayTimeout
+				lastBody = `{"error":{"message":"生图超过总时限，上游仍在排队，请稍后重试","type":"timeout_error","param":null,"code":504}}`
+				log.Printf("[image] 超过总时限，停止重试（已耗时 %.0fs）", time.Since(started).Seconds())
+				break
+			}
 			acc, err := h.Pool.Acquire(tried, model, "")
 			if err != nil {
 				if len(tried) == 0 {
@@ -1019,9 +1036,22 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 			}
 			tried = append(tried, acc.Name)
 			lastAcc = acc
-			resp, err := h.Upstream.Do(r.Context(), http.MethodPost, suffix, acc.Session, payload, nil)
+			ctx, cancel := r.Context(), context.CancelFunc(func() {})
+			if !deadline.IsZero() {
+				ctx, cancel = context.WithDeadline(ctx, deadline)
+			}
+			resp, err := h.Upstream.Do(ctx, http.MethodPost, suffix, acc.Session, payload, nil)
+			cancel()
 			if err != nil {
 				h.Pool.Release(acc)
+				// 预算耗尽不是账号的错：上游排队时换号也一样排队，不罚账号。
+				if errors.Is(err, context.DeadlineExceeded) || (!deadline.IsZero() && !time.Now().Before(deadline)) {
+					lastStatus = http.StatusGatewayTimeout
+					lastBody = `{"error":{"message":"生图超过总时限，上游仍在排队，请稍后重试","type":"timeout_error","param":null,"code":504}}`
+					h.logCall(acc, model, http.StatusGatewayTimeout, time.Since(started), "总时限耗尽", h.requestIP(r))
+					log.Printf("[image] 超过总时限 %ds，放弃请求（已耗时 %.0fs）", h.Cfg.ImageDeadlineSecond, time.Since(started).Seconds())
+					break
+				}
 				h.Pool.ReportFailure(acc, 0, err.Error(), "", model)
 				lastStatus, lastBody = http.StatusBadGateway, err.Error()
 				continue
@@ -1031,7 +1061,7 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 			if resp.Status == http.StatusBadRequest && kind == "image" {
 				// 去掉哪些字段已由 shrinkImageRetry 打日志；这里不再额外写请求行，
 				// 否则一次请求会同时出现「已精简」和「200 points=…」两行。
-				resp, payload, _ = h.shrinkImageRetry(r.Context(), suffix, acc.Session, payload, resp)
+				resp, payload, _ = h.shrinkImageRetry(r.Context(), suffix, acc.Session, payload, resp, deadline)
 			}
 			out := resp.BodyText()
 			h.Pool.Release(acc)
@@ -1073,6 +1103,11 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 		}
 		if lastStatus == 0 {
 			lastStatus = http.StatusBadGateway
+		}
+		if lastStatus >= 500 {
+			// 上游不可用/超时：告诉调用方多久后再试，别立刻重放把队列压得更死。
+			w.Header().Set("Retry-After", "20")
+			w.Header().Set("X-Loomy-Error", "upstream-unavailable")
 		}
 		h.fail(w, r, kind, model, lastAcc, lastStatus, lastBody, started)
 	}

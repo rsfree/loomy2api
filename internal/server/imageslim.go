@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/rsfree/loomy2api/internal/upstream"
 )
@@ -99,11 +100,17 @@ func imageDigest(payload map[string]any) string {
 }
 
 // shrinkImageRetry 生图 400 后按两级减肥重试（同一账号、同一上下文）。
+// deadline 非零时，跨过预算就不再重试：上游排队到 300s 才回 400 的场景里，
+// 三级各等一次会把一次请求拖到 15 分钟，字段再怎么减也没用。
 // 返回最终响应、实际采用的 payload、被去掉的键。
 func (h *Handler) shrinkImageRetry(ctx context.Context, suffix, session string,
-	payload map[string]any, resp *upstream.Response) (*upstream.Response, map[string]any, []string) {
+	payload map[string]any, resp *upstream.Response, deadline time.Time) (*upstream.Response, map[string]any, []string) {
 
 	orig := resp.BodyText() // 先读掉，避免连接泄漏
+	if !deadline.IsZero() && !time.Now().Before(deadline) {
+		log.Printf("[image] 已到总时限，跳过精简重试（最后状态 %d）", resp.Status)
+		return withBody(resp, orig), payload, nil
+	}
 	slim, dropped, ok := slimImageBody(payload)
 	if !ok {
 		return withBody(resp, orig), payload, nil
@@ -116,6 +123,9 @@ func (h *Handler) shrinkImageRetry(ctx context.Context, suffix, session string,
 	resp, payload = r2, slim
 	if resp.Status != http.StatusBadRequest {
 		return resp, payload, dropped
+	}
+	if !deadline.IsZero() && !time.Now().Before(deadline) {
+		return withBody(resp, resp.BodyText()), payload, dropped
 	}
 
 	body2 := resp.BodyText()

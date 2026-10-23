@@ -7,6 +7,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/rsfree/loomy2api/internal/upstream"
 )
 
 // TestSlimImageBody 扩展字段被剔除，n>1 也去掉；核心字段保留。
@@ -211,5 +214,65 @@ func TestImage400RetryKeepsReferenceImages(t *testing.T) {
 		if strings.Contains(retry, `"`+k+`"`) {
 			t.Errorf("重试仍带 %s：%s", k, retry)
 		}
+	}
+}
+
+// TestImageDeadlineAbortsSlowUpstream 上游排队时单次就可能 300s：总时限到了要
+// 立刻返回 504 + Retry-After，而不是把客户端吊到 15 分钟。
+func TestImageDeadlineAbortsSlowUpstream(t *testing.T) {
+	fs := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			_, _ = io.WriteString(w, `{"object":"list","data":[
+				{"id":"doubao-seedream-5-lite","name":"5 lite","type":"image"}]}`)
+			return
+		}
+		time.Sleep(1500 * time.Millisecond)
+		_, _ = io.WriteString(w, `{"created":1,"data":[{"url":"https://example.com/x.png"}],"points_consumed":110}`)
+	})
+	h, _, _ := newTestHandler(t, fs.srv.URL, nil)
+	_ = h.Models.Get(context.Background(), "sess")
+	h.Cfg.ImageDeadlineSecond = 1
+
+	started := time.Now()
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"doubao-seedream-5-lite","prompt":"一只猫"}`))
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+	elapsed := time.Since(started)
+
+	if w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("状态码 %d，期望 504：%s", w.Code, w.Body.String())
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("总时限没有生效，耗时 %v", elapsed)
+	}
+	if got := w.Header().Get("Retry-After"); got != "20" {
+		t.Errorf("Retry-After = %q，期望 20", got)
+	}
+	if !strings.Contains(w.Body.String(), "总时限") {
+		t.Errorf("错误文案没说明总时限：%s", w.Body.String())
+	}
+}
+
+// TestShrinkImageRetryStopsAtDeadline 预算已耗尽时不再做字段精简重试：
+// 上游排队到 300s 才回的 400，再减字段也是白等。
+func TestShrinkImageRetryStopsAtDeadline(t *testing.T) {
+	h := &Handler{}
+	payload := map[string]any{"model": "m", "prompt": "p", "size": "2K", "seed": 42}
+	resp := &upstream.Response{Status: http.StatusBadRequest, Body: io.NopCloser(strings.NewReader(`{"error":"bad"}`))}
+
+	out, got, dropped := h.shrinkImageRetry(context.Background(), "images/generations", "sess",
+		payload, resp, time.Now().Add(-time.Second))
+	if len(dropped) != 0 {
+		t.Errorf("预算耗尽仍做了精简：%v", dropped)
+	}
+	if out != resp {
+		t.Error("应返回原始响应")
+	}
+	if got["seed"] != 42 {
+		t.Errorf("payload 被改动：%v", got)
+	}
+	if body := out.BodyText(); !strings.Contains(body, "bad") {
+		t.Errorf("原始错误体丢了：%q", body)
 	}
 }

@@ -46,6 +46,9 @@
   "timeout_seconds": 3600,
   "_timeout_seconds": "短 RPC 超时；聊天请求不受此限制（流式可能跑很久）",
 
+  "image_deadline_seconds": 420,
+  "_image_deadline_seconds": "单次生图的总时限（含换号/精简重试）；上游拥塞时避免一次请求挂到 15 分钟",
+
   "max_retries": 2,
   "_max_retries": "换号重试次数（额度耗尽/限流/登录态失效时换下一个账号）",
 

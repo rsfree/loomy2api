@@ -258,6 +258,11 @@ curl http://127.0.0.1:17890/v1/responses \
 单图用例只出现品红、没有青绿，说明「单图语义」没有被多图污染；多图用例两种颜色
 像素占比都在 15%–23%，七个形态全部通过。
 
+**超时与 5xx 语义**：上游拥塞时单次生图可能要排队 300s，再叠加「换号 × 精简」重试会把
+一次请求拖到 15 分钟（实测 900s 才回 400/502）。现在 `image_deadline_seconds`（默认 420s）
+统一兜住整条重试链：到点立刻返回，5xx 额外带 `Retry-After: 20` 与
+`X-Loomy-Error: upstream-unavailable`；因排队超时**不罚账号**（换号也一样排队）。
+
 ```bash
 # 多图合成：把两张参考图交给同一个模型
 curl http://127.0.0.1:17890/v1/images/generations \
@@ -315,6 +320,7 @@ curl http://127.0.0.1:17890/v1/images/generations \
 | `session_renew_before_days` | `3` | 登录态剩余低于此天数时告警，并触发自动重登 |
 | `auto_relogin` | `true` | 有密码的账号到期前自动重登（滚动 14 天）；纯 session 卡密号无效 |
 | `max_retries` | `2` | 换号重试次数 |
+| `image_deadline_seconds` | `420` | 生图总时限（含换号与精简重试）；超时回 504 + `Retry-After` |
 | `quota_refresh_minutes` | `30` | 后台额度刷新间隔（顺带跨日领每日额度） |
 | `proxy` | `""` | 全局出口代理，账号级 `proxy` 可覆盖 |
 
