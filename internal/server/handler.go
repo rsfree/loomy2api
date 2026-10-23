@@ -1021,9 +1021,13 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 		var lastBody string
 		for attempt := 0; attempt <= h.Cfg.MaxRetries; attempt++ {
 			if !deadline.IsZero() && !time.Now().Before(deadline) {
-				lastStatus = http.StatusGatewayTimeout
-				lastBody = `{"error":{"message":"生图超过总时限，上游仍在排队，请稍后重试","type":"timeout_error","param":null,"code":504}}`
-				log.Printf("[image] 超过总时限，停止重试（已耗时 %.0fs）", time.Since(started).Seconds())
+				// 预算只决定「还换不换号」，不打断已经在途的那一次：
+				// 实测 7.7% 的成功请求要跑 420s 以上，掐掉它们会把成功变成 504。
+				if lastStatus == 0 {
+					lastStatus = http.StatusGatewayTimeout
+					lastBody = `{"error":{"message":"生图超过总时限，上游仍在排队，请稍后重试","type":"timeout_error","param":null,"code":504}}`
+				}
+				log.Printf("[image] 超过重试预算，停止换号（最后状态 %d，已耗时 %.0fs）", lastStatus, time.Since(started).Seconds())
 				break
 			}
 			acc, err := h.Pool.Acquire(tried, model, "")
@@ -1037,19 +1041,19 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 			tried = append(tried, acc.Name)
 			lastAcc = acc
 			ctx, cancel := r.Context(), context.CancelFunc(func() {})
-			if !deadline.IsZero() {
-				ctx, cancel = context.WithDeadline(ctx, deadline)
+			if kind == "image" {
+				ctx, cancel = context.WithTimeout(ctx, imageAttemptCap)
 			}
 			resp, err := h.Upstream.Do(ctx, http.MethodPost, suffix, acc.Session, payload, nil)
 			cancel()
 			if err != nil {
 				h.Pool.Release(acc)
 				// 预算耗尽不是账号的错：上游排队时换号也一样排队，不罚账号。
-				if errors.Is(err, context.DeadlineExceeded) || (!deadline.IsZero() && !time.Now().Before(deadline)) {
+				if errors.Is(err, context.DeadlineExceeded) {
 					lastStatus = http.StatusGatewayTimeout
-					lastBody = `{"error":{"message":"生图超过总时限，上游仍在排队，请稍后重试","type":"timeout_error","param":null,"code":504}}`
-					h.logCall(acc, model, http.StatusGatewayTimeout, time.Since(started), "总时限耗尽", h.requestIP(r))
-					log.Printf("[image] 超过总时限 %ds，放弃请求（已耗时 %.0fs）", h.Cfg.ImageDeadlineSecond, time.Since(started).Seconds())
+					lastBody = `{"error":{"message":"单次生图超过 900s 仍无响应，请稍后重试","type":"timeout_error","param":null,"code":504}}`
+					h.logCall(acc, model, http.StatusGatewayTimeout, time.Since(started), "单次尝试超时", h.requestIP(r))
+					log.Printf("[image] 单次尝试超过 %s，放弃请求（已耗时 %.0fs）", imageAttemptCap, time.Since(started).Seconds())
 					break
 				}
 				h.Pool.ReportFailure(acc, 0, err.Error(), "", model)

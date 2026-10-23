@@ -37,6 +37,11 @@ import (
 // 这里限制的是「单张解码后」的大小，避免一个坏请求把内存打满。
 const maxImagePart = 20 << 20
 
+// imageAttemptCap 单次上游生图调用的硬上限。实测成功请求的 p99 ≈ 869s，
+// 取 900s 兜住长尾；它只管「这一次调用最多等多久」，不参与「还要不要换号」
+// 的预算（那个由 image_deadline_seconds 控制）。
+const imageAttemptCap = 900 * time.Second
+
 // maxRefImages 单次请求的参考图上限。与官方客户端对齐：前端上传器的常量是
 // `Cu=4`（超出提示「最多上传 4 张图片」），网关同口径截断，只截尾不重排。
 const maxRefImages = 4

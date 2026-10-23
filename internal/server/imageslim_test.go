@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rsfree/loomy2api/internal/pool"
 	"github.com/rsfree/loomy2api/internal/upstream"
 )
 
@@ -217,9 +219,9 @@ func TestImage400RetryKeepsReferenceImages(t *testing.T) {
 	}
 }
 
-// TestImageDeadlineAbortsSlowUpstream 上游排队时单次就可能 300s：总时限到了要
-// 立刻返回 504 + Retry-After，而不是把客户端吊到 15 分钟。
-func TestImageDeadlineAbortsSlowUpstream(t *testing.T) {
+// TestImageSlowAttemptNotKilledByBudget 重试预算不能掐掉在途的那一次：
+// 实测 7.7% 的成功请求要跑 420s 以上，硬截止会把成功变成 504。
+func TestImageSlowAttemptNotKilledByBudget(t *testing.T) {
 	fs := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/models") {
 			_, _ = io.WriteString(w, `{"object":"list","data":[
@@ -233,6 +235,45 @@ func TestImageDeadlineAbortsSlowUpstream(t *testing.T) {
 	_ = h.Models.Get(context.Background(), "sess")
 	h.Cfg.ImageDeadlineSecond = 1
 
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"doubao-seedream-5-lite","prompt":"一只猫"}`))
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("慢但成功的请求被掐掉：%d %s", w.Code, w.Body.String())
+	}
+}
+
+// TestImageRetryBudgetStopsRetries 预算到了就停止换号，并把上游最后一次的状态
+// 原样返回（保留 502 语义），而不是拖满 max_retries 次。
+func TestImageRetryBudgetStopsRetries(t *testing.T) {
+	var calls int
+	fs := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			_, _ = io.WriteString(w, `{"object":"list","data":[
+				{"id":"doubao-seedream-5-lite","name":"5 lite","type":"image"}]}`)
+			return
+		}
+		calls++
+		time.Sleep(600 * time.Millisecond)
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, `{"error":{"message":"模型服务暂时不可用","type":"provider_error","code":502}}`)
+	})
+	h, pl, _ := newTestHandler(t, fs.srv.URL, nil)
+	_ = h.Models.Get(context.Background(), "sess")
+	// 换号重试要有号可换：再塞三个，否则第一次 502 就会因「没有其他账号」退出，
+	// 测不到预算本身。
+	expire := time.Now().Add(24 * time.Hour).Unix()
+	for i := 2; i <= 4; i++ {
+		bal := int64(1000)
+		pl.Add(&pool.Account{
+			Name: fmt.Sprintf("acc%d", i), Enabled: true, Session: fmt.Sprintf("sess-%d", i),
+			ExpireAt: expire, Available: &bal, LoginID: fmt.Sprintf("1380000000%d", i),
+		})
+	}
+	h.Cfg.ImageDeadlineSecond = 1
+	h.Cfg.MaxRetries = 5
+
 	started := time.Now()
 	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations",
 		strings.NewReader(`{"model":"doubao-seedream-5-lite","prompt":"一只猫"}`))
@@ -240,17 +281,17 @@ func TestImageDeadlineAbortsSlowUpstream(t *testing.T) {
 	h.Routes().ServeHTTP(w, req)
 	elapsed := time.Since(started)
 
-	if w.Code != http.StatusGatewayTimeout {
-		t.Fatalf("状态码 %d，期望 504：%s", w.Code, w.Body.String())
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("状态码 %d，期望保留上游 502：%s", w.Code, w.Body.String())
+	}
+	if calls != 2 {
+		t.Errorf("上游调用 %d 次，期望预算（1s）只够 2 次", calls)
 	}
 	if elapsed > 3*time.Second {
-		t.Errorf("总时限没有生效，耗时 %v", elapsed)
+		t.Errorf("预算没生效，耗时 %v", elapsed)
 	}
 	if got := w.Header().Get("Retry-After"); got != "20" {
 		t.Errorf("Retry-After = %q，期望 20", got)
-	}
-	if !strings.Contains(w.Body.String(), "总时限") {
-		t.Errorf("错误文案没说明总时限：%s", w.Body.String())
 	}
 }
 
