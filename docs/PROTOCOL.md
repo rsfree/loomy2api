@@ -373,9 +373,9 @@ POST {base}/onboarding/tasks/complete   body {"key":"..."} → data{alreadyCompl
 - `/v1/messages` 是本地翻译层（上游只有 OpenAI 形态），工具调用与思考链已覆盖，
   但 Anthropic 的一些细节（如 `cache_control` 断点）无法传递到上游。
 - 模型目录以 `/models` 为准；上游不可用时回落到内置表（`internal/config`）。
-- 多图参考：字段形态已与官方客户端对齐（`images` 数组），但「多张图是否都被模型真正读进去」
-  还没像单图那样做 dhash/NCC 取证（单图实测 dhash≤1、NCC≥0.997）。要拍板只能实跑一次：
-  两张互不相似的垫图 + 一句依赖两张图的提示词，每次 110 积分。
+- 多图参考已于 2026-10-23 复验（3 次实跑，各 110 积分）：两张互不相似的垫图（红圆 + 蓝方）
+  在 **一次请求**里同时出现在输出中，`images` 数组（2 个 data URI）成立；`size=2848x1600`
+  与 HTTPS URL 引用也都能出图。单图的 dhash≤1 / NCC≥0.997 口径不变。
 
 ---
 
