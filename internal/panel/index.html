@@ -290,6 +290,12 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .tk-prog .n { font: 600 12.5px var(--mono); font-variant-numeric: tabular-nums; }
 .tk-prog .bar { max-width: 96px; }
 .tk-empty { padding: 42px 20px; text-align: center; color: var(--ink-3); white-space: normal; }
+/* 邀请码批量绑定的进度条：长任务（118 条 × 1.2s ≈ 2.5 分钟）必须有肉眼可见的推进量，
+   否则用户分不清「在跑」和「卡死」，而这是不可逆操作，重复点击的代价是烧掉车票。 */
+.iv-bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin: 7px 0 10px; }
+.iv-bar > i { display: block; height: 100%; background: var(--accent); transition: width .35s ease; }
+.iv-pair { font-family: var(--mono); font-size: 12.5px; }
+.iv-pair em { color: var(--ink-3); font-style: normal; }
 .tk-empty .big { font-size: 14px; color: var(--ink-2); margin-bottom: 6px; }
 @media (max-width: 760px) { .tk { min-width: 700px; } .tk-empty { position: sticky; left: 0; width: calc(100vw - 24px); box-sizing: border-box; } }
 .md-avail { flex: none; padding: 0 6px; font-size: 10.5px; line-height: 16px; }
@@ -715,6 +721,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#tasks" data-view="tasks">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v9H8l-3 3v-3H3z"/><path d="M6 6.5h4M6 9h2.5"/></svg>
         任务中心</a></li>
+      <li><a href="#invites" data-view="invites">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.4 6.2h11.2v7.3H2.4z"/><path d="M1.6 4.2h12.8v2H1.6zM8 4.2v9.3"/><path d="M8 4.2C7 2.4 5 1.6 4.2 2.8c-.8 1.2.4 2.2 3.8 1.4M8 4.2c1-1.8 3-2.6 3.8-1.4.8 1.2-.4 2.2-3.8 1.4z"/></svg>
+        邀请码</a></li>
       <li><a href="#models" data-view="models">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
         模型与档位</a></li>
@@ -984,6 +993,61 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <th class="c-acts">操作</th>
             </tr></thead>
             <tbody id="tkBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 邀请码 -->
+    <section class="view" id="view-invites" hidden>
+      <div class="stats">
+        <div class="stat"><div class="v" id="ivAccounts">-</div><div class="k">账号总数</div></div>
+        <div class="stat good"><div class="v" id="ivBindable">-</div><div class="k">还能绑定</div></div>
+        <div class="stat"><div class="v" id="ivBound">-</div><div class="k">已绑定</div></div>
+        <div class="stat"><div class="v" id="ivNoCode">-</div><div class="k">无自持码</div></div>
+        <div class="stat"><div class="v" id="ivFailed">-</div><div class="k">查询失败</div></div>
+        <div class="stat warn"><div class="v" id="ivPotential">-</div><div class="k">预期可换积分</div></div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>绑定计划 <span class="hint">一号只能绑一次 · 双边各 5000 · 不可逆</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="ivNote">—</span>
+          <select id="ivMode" aria-label="绑定模式">
+            <option value="pair">两两互绑</option>
+            <option value="target">统一绑一个码</option>
+          </select>
+          <input id="ivTarget" type="text" placeholder="目标码 / 奇数补位码" aria-label="邀请码">
+          <button class="xs" id="btnIvPlan">预览计划</button>
+          <button class="xs primary" id="btnIvRun" disabled>执行绑定</button>
+        </header>
+        <div class="pad" id="ivPlanBox">
+          <div class="tk-empty"><div class="big">先「预览计划」，再决定执行</div>
+            <div>预览只读上游状态（每号两次 GET），不消耗任何绑定机会。</div></div>
+        </div>
+        <div class="pad" id="ivProgress" hidden></div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>账号 × 邀请码 <span class="hint">自持码 / 已绑码 / 被邀请数</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="ivMatrixNote">—</span>
+          <input id="ivQ" type="search" placeholder="搜索账号" aria-label="搜索账号">
+          <button class="xs" id="btnIvReload">刷新</button>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th>账号</th>
+              <th>自持邀请码</th>
+              <th>已绑定别人的码</th>
+              <th class="num">被邀请数</th>
+              <th>出口</th>
+              <th>状态</th>
+            </tr></thead>
+            <tbody id="ivBody"></tbody>
           </table>
         </div>
       </div>

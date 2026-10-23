@@ -830,3 +830,132 @@ func truncate(s string, n int) string {
 	}
 	return s[:n]
 }
+
+// ---------------------------------------------------------------- 邀请码
+
+// 事实来源（2026-10-23 客户端 electron/points-service.js + 实测抓包）：
+//
+//	GET  /api/v1/invitation-codes   → {list:[{inviteCode,usedCount,maxUses,status}]}
+//	GET  /api/v1/points/activation  → {activated, appliedInvitationCode}
+//	POST /api/v1/points/activation  → body {inviteCode, deviceId}
+//
+// 关键约束：**一个账号只能绑一次别人的邀请码**（绑过再提交回
+// alreadyActivated=true 且不再给分），所以「绑定」是不可逆的一次性资源；
+// 而奖励是双边的（inviteeReward / inviterReward 各 5000）。
+// 网关侧因此必须先把状态查清楚再动手，不能靠重试兜底。
+
+// InviteCode 账号自持的一个邀请码。
+type InviteCode struct {
+	Code      string `json:"inviteCode"`
+	UsedCount int64  `json:"usedCount"`
+	MaxUses   int64  `json:"maxUses"`
+	Status    string `json:"status"`
+}
+
+// Activation 账号的邀请码绑定状态（GET 与 POST 响应同形）。
+type Activation struct {
+	Activated        bool   // 已绑定（true 后不可再绑别人的码）
+	AlreadyActivated bool   // 本次提交前就已绑过（幂等判据）
+	AppliedCode      string // 绑的是哪个码
+	InviteeReward    int64  // 本次作为「被邀方」到账积分
+	InviterReward    int64  // 本次作为「邀请方」到账积分（绑别人的码时通常为 0）
+	CurrentBalance   int64
+	PermanentBalance int64
+	Codes            []InviteCode // 绑定后刷新出的自持码列表
+}
+
+// parseInviteCodes 归一 invitationCodes / list 两种拼写（GET 用 list、POST 用 invitationsCodes）。
+func parseInviteCodes(raw any) []InviteCode {
+	list, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]InviteCode, 0, len(list))
+	for _, it := range list {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		out = append(out, InviteCode{
+			Code:      str(m["inviteCode"]),
+			UsedCount: int64(num(m["usedCount"])),
+			MaxUses:   int64(num(m["maxUses"])),
+			Status:    str(m["status"]),
+		})
+	}
+	return out
+}
+
+// parseActivation 归一 activation 响应。空 data 不算错误：上游对「从未绑过」
+// 只回 {activated:false}，此时 appliedInvitationCode 缺失。
+func parseActivation(obj map[string]any) *Activation {
+	data := mapOfAny(obj["data"])
+	if data == nil {
+		data = obj
+	}
+	return &Activation{
+		Activated:        boolOf(data["activated"]),
+		AlreadyActivated: boolOf(data["alreadyActivated"]),
+		AppliedCode:      str(data["appliedInvitationCode"]),
+		InviteeReward:    int64(num(data["inviteeReward"])),
+		InviterReward:    int64(num(data["inviterReward"])),
+		CurrentBalance:   int64(num(data["currentBalance"])),
+		PermanentBalance: int64(num(data["permanentBalance"])),
+		Codes:            parseInviteCodes(data["invitationCodes"]),
+	}
+}
+
+// InvitationCodes GET /api/v1/invitation-codes：账号自持的邀请码列表。
+// 每个号注册后自带 1 个 active 码（maxUses 默认 1000）；没有码时回空切片而非报错。
+func (c *Client) InvitationCodes(ctx context.Context, session string) ([]InviteCode, error) {
+	obj, status, err := c.GetJSON(ctx, "invitation-codes", session)
+	if err != nil {
+		return nil, err
+	}
+	if status != 200 {
+		return nil, fmt.Errorf("/invitation-codes HTTP %d", status)
+	}
+	data := mapOfAny(obj["data"])
+	if data == nil {
+		data = obj
+	}
+	return parseInviteCodes(data["list"]), nil
+}
+
+// Activation GET /api/v1/points/activation：该号绑过谁的码 / 有没有绑过。
+func (c *Client) Activation(ctx context.Context, session string) (*Activation, error) {
+	obj, status, err := c.GetJSON(ctx, "points/activation", session)
+	if err != nil {
+		return nil, err
+	}
+	if status != 200 {
+		return nil, fmt.Errorf("/points/activation HTTP %d", status)
+	}
+	return parseActivation(obj), nil
+}
+
+// BindInviteCode POST /api/v1/points/activation：把 code 绑到该号。
+//
+// deviceId 传账号自己的 campus_device_id（account.Identity.CampusDev）：
+// 上游用它做设备维度归因，缺省也能成功，但每号独立的值才是客户端的真实形态
+// （一台机器一个 deviceId，账号池里一机一号）。
+//
+// 这是不可逆操作：成功后该号永久 activated。调用方必须先查 Activation。
+func (c *Client) BindInviteCode(ctx context.Context, session, code, deviceID string) (*Activation, error) {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return nil, fmt.Errorf("邀请码不能为空")
+	}
+	body := map[string]any{"inviteCode": code}
+	if deviceID = strings.TrimSpace(deviceID); deviceID != "" {
+		body["deviceId"] = deviceID
+	}
+	obj, status, err := c.PostJSON(ctx, "points/activation", session, body, nil)
+	if err != nil {
+		return nil, err
+	}
+	if status != 200 {
+		return nil, fmt.Errorf("/points/activation HTTP %d", status)
+	}
+	return parseActivation(obj), nil
+}

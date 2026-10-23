@@ -309,7 +309,7 @@ $('btnLogout').onclick = () => {
 };
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', tasks: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', tasks: '任务中心', invites: '邀请码', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   navSet(false);
   view = v;
@@ -322,6 +322,7 @@ function go(v) {
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
   if (v === 'tasks') loadTasks();
+  if (v === 'invites') loadInvites();
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
 /* 首次进入延到本轮脚本求值之后再 go()。
@@ -1558,6 +1559,189 @@ function start() {
   refTimer = setInterval(refreshVisible, 5000);
 }
 start();
+
+/* ── 邀请码 ───────────────────────────────────────────────────────── */
+/* 三条铁律（都由后端事实推出来，前端只负责不让人误触）：
+   1. 一个号只能绑一次别人的码，绑完不可撤销 —— 所以「执行」必须经过预览 + 二次确认；
+   2. 收益是双边的（被邀 5000 / 邀请 5000），所以「两两互绑」比「全灌一个码」平均多一倍；
+   3. 批量是后台任务（118 条 × 1.2s ≈ 2.5 分钟），同步请求必然超时 —— 走轮询出进度。 */
+let ivData = null, ivPlan = null, ivPoll = null;
+
+async function loadInvites() {
+  const body = $('ivBody');
+  if (!body) return;
+  body.innerHTML = '<tr><td colspan="6"><div class="tk-empty"><div class="big">正在读取各账号邀请码…</div>'
+    + '<div>每号两次 GET（activation + invitation-codes）· 并发 8 路 · 单号 15s 超时</div></div></td></tr>';
+  $('btnIvPlan').disabled = true;
+  try {
+    renderInvites(await api('invites'));
+  } catch (e) {
+    body.innerHTML = '<tr><td colspan="6"><div class="tk-empty"><div class="big">读取失败</div>'
+      + '<div>' + esc(e.message) + '</div></div></td></tr>';
+    $('btnIvPlan').disabled = false;
+  }
+}
+
+function renderInvites(d) {
+  ivData = d;
+  const sum = d.summary || {}, rows = d.accounts || [];
+  $('ivAccounts').textContent = sum.accounts || 0;
+  $('ivBindable').textContent = sum.bindable || 0;
+  $('ivBound').textContent = sum.bound || 0;
+  $('ivNoCode').textContent = sum.no_code || 0;
+  $('ivFailed').textContent = sum.failed || 0;
+  $('ivPotential').textContent = fmtPoints(sum.potential || 0);
+  $('ivMatrixNote').textContent = (sum.bindable || 0) + ' 个号还能绑 · 单次双边各 ' + fmtPoints(sum.reward_each || 5000);
+  $('btnIvPlan').disabled = false;
+
+  renderIvRows();
+
+  // 刷新页面时若后台任务还在跑，直接把进度接上（否则用户会以为任务丢了）。
+  if (d.job && d.job.running) startIvPoll();
+
+  const q = ($('ivQ').value || '').trim().toLowerCase();
+  $('ivNote').textContent = q ? '筛选 ' + q : (sum.bindable ? '可绑定 ' + sum.bindable + ' 个' : '无可绑定账号');
+}
+
+function renderIvRows() {
+  const body = $('ivBody');
+  if (!body || !ivData) return;
+  const q = ($('ivQ').value || '').trim().toLowerCase();
+  const rows = (ivData.accounts || []).filter(r => !q
+    || String(r.name || '').toLowerCase().includes(q)
+    || String(r.remark || '').toLowerCase().includes(q)
+    || String(r.code || '').toLowerCase().includes(q));
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="6"><div class="tk-empty"><div class="big">没有匹配的账号</div>'
+      + '<div>换个关键词试试，或点「刷新」重新读取上游状态。</div></div></td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map(r => {
+    const codes = r.codes || [];
+    const main = codes[0] || null;
+    const used = main ? (Number(main.usedCount) || 0) : 0;
+    const cap = main ? (Number(main.maxUses) || 0) : 0;
+    const st = r.error
+      ? '<span class="tag bad" title="' + esc(r.error) + '">查询失败</span>'
+      : r.bound
+        ? '<span class="tag mute">已绑定</span>'
+        : (r.code ? '<span class="tag ok">可绑定</span>' : '<span class="tag warn">无自持码</span>');
+    return '<tr>'
+      + '<td><div class="nm">' + esc(r.name) + '</div>'
+      + (r.remark ? '<div class="sub">' + esc(r.remark) + '</div>' : '') + '</td>'
+      + '<td>' + (r.code
+        ? '<span class="tag mute" title="被邀请数 / 上限">' + esc(r.code) + '</span>'
+        : '<span class="dim">—</span>') + '</td>'
+      + '<td>' + (r.applied ? '<span class="tag ok">' + esc(r.applied) + '</span>' : '<span class="dim">未绑定</span>') + '</td>'
+      + '<td class="num">' + (main ? used + ' / ' + cap : '—') + '</td>'
+      + '<td class="mono dim">' + esc(r.egress || '—') + '</td>'
+      + '<td>' + st + '</td>'
+      + '</tr>';
+  }).join('');
+}
+
+$('ivQ').oninput = () => { if (ivData) renderIvRows(); };
+$('btnIvReload').onclick = () => loadInvites();
+
+// 预览：把「谁绑谁的码」摊开给人看。不可逆操作不能只给一个按钮。
+$('btnIvPlan').onclick = async () => {
+  const btn = $('btnIvPlan');
+  btn.disabled = true; btn.textContent = '核对中…';
+  $('btnIvRun').disabled = true;
+  const mode = $('ivMode').value, target = ($('ivTarget').value || '').trim();
+  if (mode === 'target' && !target) { toast('统一绑码模式需要填写目标邀请码', 'err'); btn.disabled = false; btn.textContent = '预览计划'; return; }
+  try {
+    const d = await api('invites/bind', { method: 'POST', body: JSON.stringify({ mode, target, confirm: false }) });
+    ivPlan = d;
+    renderIvPlan(d);
+    $('btnIvRun').disabled = !(d.plan || []).length;
+    toast((d.plan || []).length ? '计划已生成：' + d.plan.length + ' 条绑定' : '没有可绑定的账号', (d.plan || []).length ? 'ok' : 'err');
+  } catch (e) { toast(e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '预览计划'; }
+};
+
+function renderIvPlan(d) {
+  const box = $('ivPlanBox'), plan = d.plan || [], un = d.unpaired || [];
+  if (!plan.length) {
+    box.innerHTML = '<div class="tk-empty"><div class="big">没有可执行的绑定</div>'
+      + '<div>候选号要么都绑过了，要么没有自持码 / 登录态失效。</div></div>';
+    return;
+  }
+  const gained = Number(d.estimate || 0);
+  let html = '<div class="note" style="margin-bottom:10px">模式 <b>' + (d.mode === 'pair' ? '两两互绑' : '统一绑码')
+    + '</b> · ' + plan.length + ' 条 · 每条让被邀方到账 ' + fmtPoints((d.summary || {}).reward_each || 5000)
+    + '，池子合计 <b>' + fmtPoints(gained * 2) + '</b>（双边）</div>';
+  html += '<div class="tbl-wrap"><table class="acc"><thead><tr><th>账号</th><th>绑定到</th><th>码的持有者</th><th>说明</th></tr></thead><tbody>'
+    + plan.map(a => '<tr><td>' + esc(a.account) + '</td><td class="iv-pair">' + esc(a.code) + '</td>'
+      + '<td class="iv-pair">' + (a.from ? esc(a.from) : '<em>外部码</em>') + '</td>'
+      + '<td class="dim">' + esc(a.note || '') + '</td></tr>').join('')
+    + '</tbody></table></div>';
+  if (un.length) {
+    html += '<div class="note" style="margin-top:10px">落单未绑：' + un.map(esc).join('、')
+      + '（奇数个 / 无可配对码）。填一个「奇数补位码」再预览，可把这 1 次的 5000 也换出来。</div>';
+  }
+  box.innerHTML = html;
+}
+
+$('btnIvRun').onclick = async () => {
+  if (!ivPlan || !(ivPlan.plan || []).length) return;
+  const n = ivPlan.plan.length;
+  if (!confirm('即将执行 ' + n + ' 条绑定，每个号只能绑一次且不可撤销。\n\n执行前会逐号复查上游状态，已绑过的自动跳过。确认执行？')) return;
+  const btn = $('btnIvRun');
+  btn.disabled = true; btn.textContent = '执行中…';
+  try {
+    const d = await api('invites/bind', {
+      method: 'POST',
+      body: JSON.stringify({ mode: ivPlan.mode, target: ($('ivTarget').value || '').trim(), confirm: true }),
+    });
+    if (!d.started) { toast(d.message || '没有启动任务', 'err'); btn.disabled = false; btn.textContent = '执行绑定'; return; }
+    toast('已启动：共 ' + d.total + ' 条，逐条执行中…', 'ok');
+    startIvPoll();
+  } catch (e) {
+    toast(e.message, 'err');
+    btn.disabled = false; btn.textContent = '执行绑定';
+  }
+};
+
+function startIvPoll() {
+  if (ivPoll) clearInterval(ivPoll);
+  const tick = async () => {
+    let p;
+    try { p = await api('invites/progress'); } catch (e) { return; }
+    renderIvProgress(p);
+    if (!p.running) {
+      clearInterval(ivPoll); ivPoll = null;
+      $('btnIvRun').disabled = false; $('btnIvRun').textContent = '执行绑定';
+      if (Number(p.done) > 0) toast('绑定完成：成功 ' + p.done + ' 条，到账 ' + fmtPoints(p.gained || 0) + ' 积分', 'ok');
+      if (Number(p.failed) > 0) toast('其中 ' + p.failed + ' 条失败，见下方结果表', 'err');
+      loadInvites(); // 结束时必须重取矩阵：额度与绑定状态都变了
+    }
+  };
+  tick();
+  ivPoll = setInterval(tick, 2000);
+}
+
+function renderIvProgress(p) {
+  const box = $('ivProgress');
+  box.hidden = false;
+  const total = Number(p.total || 0), done = Number(p.done || 0) + Number(p.skipped || 0) + Number(p.failed || 0);
+  const pct = total ? Math.min(100, Math.round(done / total * 100)) : 0;
+  let html = '<div class="note">' + (p.running ? '执行中' : '已结束') + '：' + done + ' / ' + total
+    + ' · 成功 <b>' + (p.done || 0) + '</b> · 跳过 ' + (p.skipped || 0) + ' · 失败 <b>' + (p.failed || 0) + '</b>'
+    + ' · 本次到账 ' + fmtPoints(p.gained || 0) + ' 积分</div>';
+  html += '<div class="iv-bar"><i style="width:' + pct + '%"></i></div>';
+  const rs = (p.results || []).slice().reverse();
+  if (rs.length) {
+    html += '<div class="tbl-wrap" style="max-height:320px"><table class="acc"><thead><tr>'
+      + '<th>账号</th><th>码</th><th>结果</th><th>说明</th><th class="num">到账</th></tr></thead><tbody>'
+      + rs.map(r => '<tr><td>' + esc(r.account) + '</td><td class="iv-pair">' + esc(r.code) + '</td>'
+        + '<td>' + (r.ok ? '<span class="tag ok">成功</span>' : r.skipped ? '<span class="tag mute">跳过</span>' : '<span class="tag bad">失败</span>') + '</td>'
+        + '<td class="dim">' + esc(r.reason || '') + '</td>'
+        + '<td class="num">' + (r.invitee_reward ? '+' + fmtPoints(r.invitee_reward) : '—') + '</td></tr>').join('')
+      + '</tbody></table></div>';
+  }
+  box.innerHTML = html;
+}
 
 /* ── 用量 ─────────────────────────────────────────────────────────── */
 /* 图表用原生 SVG 手绘：面板是 go:embed 单文件、无构建步骤，引入图表库

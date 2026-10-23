@@ -732,3 +732,89 @@ func TestClientForEgress(t *testing.T) {
 		t.Error("direct 模式应使用默认 client")
 	}
 }
+
+// TestBindInviteCodeRealSample 绑定邀请码：请求体形状 + 响应解析。
+// 样本为 2026-10-23 真实响应（13053042237 绑 CARQ4Y 那一单）。
+func TestBindInviteCodeRealSample(t *testing.T) {
+	var gotPath, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = io.WriteString(w, `{"code":"000000","desc":"成功","data":{"activated":true,"alreadyActivated":false,
+			"currentBalance":25000,"permanentBalance":20000,"dailyBalance":5000,"dailyQuota":5000,"dailyConsumed":0,
+			"dailyCycleDate":"2026-10-24","registerReward":0,"inviteeReward":5000,"inviterReward":5000,
+			"invitationCodes":[{"inviteCode":"8MBAHT","usedCount":0,"maxUses":1000,"status":"active"}],
+			"appliedInvitationCode":"CARQ4Y"}}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "1.0.0", "", 5*time.Second)
+	act, err := c.BindInviteCode(context.Background(), "sess", " CARQ4Y ", "loomy-campus-abc")
+	if err != nil {
+		t.Fatalf("BindInviteCode 失败: %v", err)
+	}
+	// 路径必须是 points/activation（客户端 points-service.js 的 bindInviteCode 同址）。
+	if !strings.HasSuffix(gotPath, "/points/activation") {
+		t.Errorf("打到 %q，期望 /points/activation", gotPath)
+	}
+	// 码要去空白；deviceId 必须随行（上游做设备维度归因）。
+	if !strings.Contains(gotBody, `"inviteCode":"CARQ4Y"`) {
+		t.Errorf("请求体缺 inviteCode 或未去空白: %s", gotBody)
+	}
+	if !strings.Contains(gotBody, `"deviceId":"loomy-campus-abc"`) {
+		t.Errorf("请求体缺 deviceId: %s", gotBody)
+	}
+	if !act.Activated || act.AlreadyActivated {
+		t.Errorf("激活标记不对: %+v", act)
+	}
+	if act.InviteeReward != 5000 || act.InviterReward != 5000 {
+		t.Errorf("双边奖励解析不对: %+v", act)
+	}
+	if act.AppliedCode != "CARQ4Y" {
+		t.Errorf("AppliedCode = %q", act.AppliedCode)
+	}
+	if len(act.Codes) != 1 || act.Codes[0].Code != "8MBAHT" || act.Codes[0].MaxUses != 1000 {
+		t.Errorf("自持码解析不对: %+v", act.Codes)
+	}
+}
+
+// TestInvitationCodesList 自持邀请码列表：list 形状解析 + 空列表不报错。
+func TestInvitationCodesList(t *testing.T) {
+	var empty bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if empty {
+			_, _ = io.WriteString(w, `{"code":"000000","data":{"list":[]}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"code":"000000","data":{"list":[
+			{"inviteCode":"CARQ4Y","usedCount":7,"maxUses":1000,"status":"active"}]}}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "1.0.0", "", 5*time.Second)
+	codes, err := c.InvitationCodes(context.Background(), "sess")
+	if err != nil {
+		t.Fatalf("InvitationCodes 失败: %v", err)
+	}
+	if len(codes) != 1 || codes[0].Code != "CARQ4Y" || codes[0].UsedCount != 7 || codes[0].MaxUses != 1000 {
+		t.Fatalf("解析不对: %+v", codes)
+	}
+	if codes[0].Status != "active" {
+		t.Errorf("status = %q", codes[0].Status)
+	}
+
+	empty = true
+	codes, err = c.InvitationCodes(context.Background(), "sess")
+	if err != nil || len(codes) != 0 {
+		t.Fatalf("空列表应返回空切片且无错误: %v %+v", err, codes)
+	}
+}
+
+// TestBindInviteCodeEmpty 空码在本地就拦住，不打上游（省一次必然失败的请求）。
+func TestBindInviteCodeEmpty(t *testing.T) {
+	c := NewClient("http://127.0.0.1:1", "1.0.0", "", time.Second)
+	if _, err := c.BindInviteCode(context.Background(), "sess", "   ", ""); err == nil {
+		t.Fatal("空邀请码应报错")
+	}
+}

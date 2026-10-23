@@ -320,6 +320,46 @@ POST {base}/onboarding/tasks/complete   body {"key":"..."} → data{alreadyCompl
 - 响应里的 `earned` 是**累计已领**而非本次增量，网关一律按本地表现算（官方客户端同做法）。
 - 领取后 `balance` 会变，需要再打一次 `points/records` 才能拿到新的 `dailyBalance`。
 
+### 5.3.6 邀请码（`/invitation-codes` + `/points/activation`）
+
+三个端点，全在模型网关域下（与 `points/records` 同域，**不是**账号服务）：
+
+```
+GET  {base}/invitation-codes    → data.list[{inviteCode, usedCount, maxUses, status}]
+GET  {base}/points/activation   → data{activated, appliedInvitationCode}
+POST {base}/points/activation   body {"inviteCode":"CARQ4Y","deviceId":"loomy-campus-…"}
+```
+
+POST 的真实响应（2026-10-23 实测，13053042237 绑 CARQ4Y）：
+
+```json
+{"code":"000000","desc":"成功","data":{
+  "activated":true,"alreadyActivated":false,
+  "currentBalance":25000,"permanentBalance":20000,"dailyBalance":5000,
+  "inviteeReward":5000,"inviterReward":5000,
+  "invitationCodes":[{"inviteCode":"8MBAHT","usedCount":0,"maxUses":1000,"status":"active"}],
+  "appliedInvitationCode":"CARQ4Y"}}
+```
+
+协议事实（客户端 `electron/points-service.js` + 实跑核对）：
+
+- **奖励是双边的**：被邀方 `inviteeReward=5000`、邀请方 `inviterReward=5000`，
+  同一笔绑定让池子总共 +10000。
+- **一个账号只能绑一次别人的码**：绑过之后 `activated` 永久为真，再提交别人的码
+  只回 `alreadyActivated=true` 且不给分。这是一次性资源，误绑不可逆。
+- **`deviceId` 是客户端 keyring 里的 `loomy-campus-<uuid>`（或 `-fp-<sha256(machineId)>`）**，
+  上游做设备维度归因；缺省也能成功，但网关按账号各自的 `identity.campus_device_id` 发送，
+  才符合「一台机器一个号」的真实形态。
+- **每个号自持 1 个邀请码**（注册即发，`maxUses` 默认 1000，`status=active`），
+  所以池子内部可以两两互绑：A 绑 B 的码、B 绑 A 的码，双方各拿 10000。
+- 绑定后 `invitationCodes` 会随响应一起刷新（新号第一次绑定时才拿到自己的码）。
+
+网关实现：`upstream.InvitationCodes` / `upstream.Activation` / `upstream.BindInviteCode`；
+面板「邀请码」页（`GET /panel/api/invites`、`POST /panel/api/invites/bind`、
+`GET /panel/api/invites/progress`）做矩阵展示 + 预览 + 后台批量绑定。
+批量执行串行 + 默认 1.2s 间隔，且每条之前**现场复查** `activation`——
+本地 `invite_applied` 只是快照，拿它当判据会在「别处已绑」时白打一次 POST。
+
 ### 5.4 长任务与非流式的 504
 
 上游对「长时间无响应的**非流式**请求」约 60 秒就返回 504；而**同一模型的流式调用**

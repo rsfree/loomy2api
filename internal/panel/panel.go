@@ -64,6 +64,10 @@ type Panel struct {
 	onboardMu   sync.Mutex
 	onboardLast time.Time
 
+	// 邀请码批量绑定任务（同一时刻只允许一个在跑，进度供前端轮询）。
+	inviteMu  sync.Mutex
+	inviteJob *inviteJob
+
 	started time.Time
 }
 
@@ -119,6 +123,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{name}/onboarding", p.withAuth(p.onboardingAccount))
 	p.mux.HandleFunc("POST /panel/api/onboarding_all", p.withAuth(p.onboardingAll))
 	p.mux.HandleFunc("GET /panel/api/onboarding", p.withAuth(p.onboardingMatrix))
+	p.mux.HandleFunc("GET /panel/api/invites", p.withAuth(p.invitesHandler))
+	p.mux.HandleFunc("POST /panel/api/invites/bind", p.withAuth(p.inviteBindHandler))
+	p.mux.HandleFunc("GET /panel/api/invites/progress", p.withAuth(p.inviteProgressHandler))
 	p.mux.HandleFunc("GET /panel/api/dead_models", p.withAuth(p.deadModelsHandler))
 	p.mux.HandleFunc("POST /panel/api/dead_models/{model}/clear", p.withAuth(p.clearDeadModel))
 

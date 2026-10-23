@@ -45,6 +45,16 @@ type Account struct {
 
 	Identity account.Identity `json:"identity,omitempty"`
 
+	// 邀请码状态（缓存自上游，落盘）。
+	//
+	// 上游一个账号**只能绑一次**别人的码，绑完永久 activated、再绑不再给分，
+	// 所以这几个字段是「这张一次性车票用没用过」的本地账本：面板据此判断
+	// 哪些号还能参与互绑，批量执行时也靠它做预筛（失败仍以现场 GET 为准）。
+	InviteCode    string `json:"invite_code,omitempty"`    // 自持的邀请码（被别人绑的那个）
+	InviteApplied string `json:"invite_applied,omitempty"` // 自己绑过的别人的码
+	InviteReward  int64  `json:"invite_reward,omitempty"`  // 从邀请码累计拿到的积分
+	InviteBoundAt int64  `json:"invite_bound_at,omitempty"`
+
 	// 额度缓存（来自 /points/records + /points/first-login）
 	Balance        *int64 `json:"balance,omitempty"`
 	DailyBalance   *int64 `json:"daily_balance,omitempty"`
