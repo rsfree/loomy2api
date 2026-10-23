@@ -327,6 +327,39 @@ POST {base}/onboarding/tasks/complete   body {"key":"..."} → data{alreadyCompl
 内部改用 `stream: true` 调上游，边收 SSE 边聚合，最后拼回非流式 JSON——
 客户端完全无感，长任务不再被掐断。
 
+### 5.5 生图 / 图生图（`/images/generations`，2026-10-23 客户端代码核对）
+
+官方客户端的图片工具（`electron/image/image-generation-service.js`）只有两条路径，都打
+`POST {base}/images/generations`，请求头带 `X-Loomy-Request-Purpose: image.generate`：
+
+```json
+// 文生图
+{"model":"doubao-seedream-5-lite","prompt":"一只橘猫","n":1,
+ "size":"2304x1728","response_format":"url"}
+
+// 图生图（1..N 张参考图，官方客户端上限 4）
+{"model":"doubao-seedream-5-lite","prompt":"把第一张图的产品放进第二张图的场景",
+ "images":["data:image/png;base64,iVBORw0...","https://example.com/room.jpg"],
+ "n":1,"size":"2304x1728","response_format":"url"}
+```
+
+几条必须注意的口径：
+
+1. **参考图字段是复数 `images`（数组）**，单图也发数组——客户端不分单双，一律发数组，
+   且从不上报单数 `image`。单数 `image` 只认字符串：传数组会被**静默忽略**，
+   出图与原图无关（2026-10-22 实测，各扣 110 分）。
+2. 数组元素可以是 URL 或 `data:image/...;base64,`，**两者可混用**；顺序即提示词里的
+   「第一张 / 第二张」，客户端按附件顺序 map，不乱序。
+3. 默认参数 `n=1`、`size=2304x1728`、`response_format=url` 由客户端写死（`_generateTextToImage`
+   与 `_generateImageToImage` 共用），`size` 另接受 `2K` / `4K` 预设。
+4. 响应是 OpenAI 形态：`data[].url`（或 `b64_json`）；**扣分在顶层 `points_consumed`**，
+   没有 `usage`。计费按张，三个图像模型 × 任意分辨率统一 110 积分/张，耗时 16–48s。
+5. **4 张上限来自前端**（main bundle 常量 `Cu=4`，超出提示「最多上传 4 张图片」），
+   不是服务端报错——所以 >4 的服务端行为未知；网关按同口径截断，不送未经验证的张数。
+6. 网关对**客户端侧**的字段收口（`image` 字符串/数组、`null`/`[]` 视为没图、空串 400、
+   单张 32M 字符上限、`mask` 依赖 `image`）对齐参考项目
+   `image-adapter` 的 `validate_images_body`，细节见 README「生图：参考图字段的真实形态」。
+
 ## 6. 风险控制相关的观察
 
 - 客户端身份字段（`devid` / `ua` / `modelid` / `version`）是**常量**，
@@ -340,6 +373,9 @@ POST {base}/onboarding/tasks/complete   body {"key":"..."} → data{alreadyCompl
 - `/v1/messages` 是本地翻译层（上游只有 OpenAI 形态），工具调用与思考链已覆盖，
   但 Anthropic 的一些细节（如 `cache_control` 断点）无法传递到上游。
 - 模型目录以 `/models` 为准；上游不可用时回落到内置表（`internal/config`）。
+- 多图参考：字段形态已与官方客户端对齐（`images` 数组），但「多张图是否都被模型真正读进去」
+  还没像单图那样做 dhash/NCC 取证（单图实测 dhash≤1、NCC≥0.997）。要拍板只能实跑一次：
+  两张互不相似的垫图 + 一句依赖两张图的提示词，每次 110 积分。
 
 ---
 

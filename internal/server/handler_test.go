@@ -1005,8 +1005,8 @@ func TestImageModelResponsesFrontDoor(t *testing.T) {
 	}
 }
 
-// TestImageEditsJSONMulti 生图 edits 的 JSON 前门：多图在上游会被整体丢掉
-// （实测：出与原图无关的人脸），所以只转发第一张，并回警告头。
+// TestImageEditsJSONMulti 生图 edits 的 JSON 前门：多图要原样转成 images 数组
+// （官方客户端形态），顺序不能动，也不再「只留第一张」。
 func TestImageEditsJSONMulti(t *testing.T) {
 	fs := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/models") {
@@ -1029,19 +1029,22 @@ func TestImageEditsJSONMulti(t *testing.T) {
 		t.Fatalf("状态码 %d：%s", w.Code, w.Body.String())
 	}
 	sent := fs.bodies[len(fs.bodies)-1]
-	if !strings.Contains(sent, `"image":"https://a/1.png"`) {
-		t.Errorf("多图应退化成第一张：%s", sent)
+	if !strings.Contains(sent, `"images":["https://a/1.png","https://a/2.png"]`) {
+		t.Errorf("多图没按 images 数组转发：%s", sent)
 	}
-	if got := w.Header().Get("X-Loomy-Image-Warn"); got != "multi-image-unsupported-used-first" {
-		t.Errorf("多图必须回警告头，得到 %q", got)
+	if strings.Contains(sent, `"image":"`) {
+		t.Errorf("多图不该再带单数 image：%s", sent)
+	}
+	if got := w.Header().Get("X-Loomy-Image-Warn"); got != "" {
+		t.Errorf("4 张以内不该告警，得到 %q", got)
 	}
 	if len(p.All()) != 1 || p.All()[0].PointsUsed != 110 {
 		t.Errorf("生图扣分未入账：%+v", p.All()[0].PointsUsed)
 	}
 }
 
-// TestImageEditsMultipartTwoFiles multipart 的 image[] 要按顺序转成 data URI；
-// 多图在本上游不吃，最终只转发第一张（顺序解析仍要正确）。
+// TestImageEditsMultipartTwoFiles multipart 的 image[] 要按顺序转成 data URI
+// 并作为 images 数组转发（多图合成，顺序即「第一张/第二张」）。
 func TestImageEditsMultipartTwoFiles(t *testing.T) {
 	fs := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/models") {
@@ -1078,14 +1081,43 @@ func TestImageEditsMultipartTwoFiles(t *testing.T) {
 		t.Fatalf("状态码 %d：%s", w.Code, w.Body.String())
 	}
 	sent := fs.bodies[len(fs.bodies)-1]
-	if strings.Count(sent, "data:image/png;base64,") != 1 {
-		t.Errorf("多图应只转发第一张：%s", sent)
+	if n := strings.Count(sent, "data:image/png;base64,"); n != 2 {
+		t.Errorf("两张参考图都要转发，实际 %d 张：%s", n, sent)
 	}
-	if !strings.Contains(sent, `"image":"data:image/png;base64,`) {
-		t.Errorf("参考图应以字符串形态转发：%s", sent)
+	if !strings.Contains(sent, `"images":["data:image/png;base64,`) {
+		t.Errorf("参考图应以 images 数组形态转发：%s", sent)
 	}
-	if got := w.Header().Get("X-Loomy-Image-Warn"); got != "multi-image-unsupported-used-first" {
-		t.Errorf("多图必须回警告头，得到 %q", got)
+	if got := w.Header().Get("X-Loomy-Image-Warn"); got != "" {
+		t.Errorf("两张参考图不该告警，得到 %q", got)
+	}
+}
+
+// TestImageEditsJSONImagesField edits 的 JSON 前门也要认官方客户端的 images 数组，
+// 不能只认单数 image（否则官方形态会被判成「没有参考图」而 400）。
+func TestImageEditsJSONImagesField(t *testing.T) {
+	fs := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"Hy-Image-3.5-preview","type":"image"}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"created":1,"data":[{"url":"https://example.com/x.png"}],"points_consumed":110}`)
+	})
+	h, _, _ := newTestHandler(t, fs.srv.URL, nil)
+	if list := h.Models.Get(context.Background(), "sess"); len(list) != 1 {
+		t.Fatalf("目录预热失败：%d 个模型", len(list))
+	}
+
+	body := `{"model":"Hy-Image-3.5-preview","prompt":"合成","images":["https://a/1.png","https://a/2.png"]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 %d：%s", w.Code, w.Body.String())
+	}
+	sent := fs.bodies[len(fs.bodies)-1]
+	if !strings.Contains(sent, `"images":["https://a/1.png","https://a/2.png"]`) {
+		t.Errorf("images 数组没被转发：%s", sent)
 	}
 }
 

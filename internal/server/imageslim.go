@@ -24,8 +24,10 @@ import (
 // 先去掉白名单外的字段，仍 400 就只留 model / prompt / image / size。
 
 // imageCoreKeys 生图请求的核心字段（其余都可能被下游 provider 拒绝）。
+// `images` 必须在内：多图走的是这个字段，减肥时把它丢掉等于把垫图也丢了
+// （上游不会报错，只会安静地出一张文生图）。
 var imageCoreKeys = map[string]bool{
-	"model": true, "prompt": true, "image": true,
+	"model": true, "prompt": true, "image": true, "images": true,
 	"size": true, "n": true, "response_format": true,
 }
 
@@ -52,10 +54,10 @@ func slimImageBody(payload map[string]any) (map[string]any, []string, bool) {
 	return out, dropped, true
 }
 
-// minimalImageBody 只留 model / prompt / image / size。
+// minimalImageBody 只留 model / prompt / image(images) / size。
 // 已经是最小集合时 ok=false。
 func minimalImageBody(payload map[string]any) (map[string]any, bool) {
-	keep := map[string]bool{"model": true, "prompt": true, "image": true, "size": true}
+	keep := map[string]bool{"model": true, "prompt": true, "image": true, "images": true, "size": true}
 	out := make(map[string]any, len(keep))
 	extra := 0
 	for k, v := range payload {
@@ -79,11 +81,19 @@ func imageDigest(payload map[string]any) string {
 	}
 	sort.Strings(keys)
 	img := "none"
-	switch v := payload["image"].(type) {
-	case string:
-		img = "single"
+	switch v := payload["images"].(type) {
 	case []any:
-		img = fmt.Sprintf("array(%d)", len(v))
+		if len(v) > 0 {
+			img = fmt.Sprintf("images(%d)", len(v))
+		}
+	}
+	if img == "none" {
+		switch v := payload["image"].(type) {
+		case string:
+			img = "single"
+		case []any:
+			img = fmt.Sprintf("array(%d)", len(v))
+		}
 	}
 	return fmt.Sprintf("keys=%v size=%v n=%v image=%s", keys, payload["size"], payload["n"], img)
 }

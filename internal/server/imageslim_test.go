@@ -140,3 +140,76 @@ func TestImage400NoExtraFields(t *testing.T) {
 		t.Errorf("错误原文应透传：%s", w.Body.String())
 	}
 }
+
+// TestSlimImageBodyKeepsImages 减肥白名单必须包含 images：
+// 把它当扩展字段剔掉，等于把多张参考图整段扔掉（上游不报错，只会出一张文生图）。
+func TestSlimImageBodyKeepsImages(t *testing.T) {
+	out, _, ok := slimImageBody(map[string]any{
+		"model": "m", "prompt": "p", "images": []any{"u1", "u2"},
+		"size": "2K", "watermark": true,
+	})
+	if !ok {
+		t.Fatal("应判定为需要精简")
+	}
+	if _, exists := out["images"]; !exists {
+		t.Errorf("images 被剔除了：%v", out)
+	}
+}
+
+// TestMinimalImageBodyKeepsImages 退到最小集合时同样要保留 images。
+func TestMinimalImageBodyKeepsImages(t *testing.T) {
+	out, ok := minimalImageBody(map[string]any{
+		"model": "m", "prompt": "p", "images": []any{"u1", "u2"},
+		"size": "2K", "response_format": "b64_json",
+	})
+	if !ok {
+		t.Fatal("应判定为可继续精简")
+	}
+	if _, exists := out["images"]; !exists {
+		t.Errorf("images 被剔除了：%v", out)
+	}
+}
+
+// TestImage400RetryKeepsReferenceImages 全链路回归：400 触发减肥重试后，
+// 重试请求里必须还带着 images（顺序不变），只去掉真正多余的字段。
+func TestImage400RetryKeepsReferenceImages(t *testing.T) {
+	calls := 0
+	fs := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			_, _ = io.WriteString(w, `{"object":"list","data":[
+				{"id":"doubao-seedream-5-lite","name":"5 lite","type":"image"}]}`)
+			return
+		}
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"请求有误，请重试","code":400}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"created":1,"data":[{"url":"https://example.com/x.png"}],"points_consumed":110}`)
+	})
+	h, _, _ := newTestHandler(t, fs.srv.URL, nil)
+	_ = h.Models.Get(context.Background(), "sess")
+
+	body := `{"model":"doubao-seedream-5-lite","prompt":"合成","images":["u1","u2"],
+		"size":"2K","watermark":true,"seed":7}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("客户端不该看到 400：%d %s", w.Code, w.Body.String())
+	}
+	if calls != 2 {
+		t.Fatalf("上游调用 %d 次，期望 400 + 精简重试", calls)
+	}
+	retry := fs.bodies[len(fs.bodies)-1]
+	if !strings.Contains(retry, `"images":["u1","u2"]`) {
+		t.Errorf("重试把参考图丢了：%s", retry)
+	}
+	for _, k := range []string{"watermark", "seed"} {
+		if strings.Contains(retry, `"`+k+`"`) {
+			t.Errorf("重试仍带 %s：%s", k, retry)
+		}
+	}
+}

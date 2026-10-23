@@ -2,15 +2,22 @@
 //
 // 蓝本 jushenzhidao/image-adapter：`/v1/images/edits` 与 generations 不是两套
 // 语义，只是载体不同（multipart 文件上传 vs JSON）。所以这里不做第二套适配：
-// 把 multipart 归一成同一个 canonical JSON（image 可以是字符串或数组、mask 原样），
-// 再交给 generations 那条透传管道——选号、冷却、记账、模型校验全部复用。
+// 把 multipart 归一成同一个 canonical JSON，再交给 generations 那条透传管道——
+// 选号、冷却、记账、模型校验全部复用。
 //
-// 实测上游（2026-10-22，逐张 110 分核对过）：
-//   - `image` 传字符串（URL 或 data URI）才有图生图效果，原图主体完整保留；
-//   - `image` 传数组 = 参考图**整体被丢弃**，`["url"]` / `["a","b"]` / `["a","a"]`
-//     都会退化成纯文生图（出与原图无关的人脸）。多图合成能力不存在，
-//     所以归一后一律只发第一张的字符串形态（见 normalizeImageField）；
-//   - 未知字段上游会忽略（但 `seed` / `watermark` 这类可能触发 400，见 imageslim.go）。
+// 参考图字段的真实口径（2026-10-23 读官方客户端 0.9.38 的
+// electron/image/image-generation-service.js 及其 __tests__ 得到）：
+// 图生图 body = { model, prompt, images: ["<url | data URI>", ...], n: 1,
+// size: "2304x1728", response_format: "url" } —— **多图走 `images` 数组**，
+// 单图同样是数组：客户端不分单双，一律发 `images`，且从不上报单数 `image`。
+//
+// 单数 `image` 是本网关的历史形态。上游对 `image` 传数组会静默忽略
+// （2026-10-22 实测：出图与原图无关），传字符串则正常垫图。因此：
+//   - 单图继续走 `image` 字符串（已实测有效，dhash≈1，NCC≈0.998）；
+//   - 多图改走 `images` 数组（与官方客户端一致）。
+//
+// 前端上传器上限 4 张（main bundle 常量 `Cu=4`），网关同口径截断。
+// 未知字段上游会忽略（但 `seed` / `watermark` 这类可能触发 400，见 imageslim.go）。
 package server
 
 import (
@@ -29,6 +36,19 @@ import (
 // maxImagePart 单张参考图上限。整包还有 withAuth 的 256MB 兜底，
 // 这里限制的是「单张解码后」的大小，避免一个坏请求把内存打满。
 const maxImagePart = 20 << 20
+
+// maxRefImages 单次请求的参考图上限。与官方客户端对齐：前端上传器的常量是
+// `Cu=4`（超出提示「最多上传 4 张图片」），网关同口径截断，只截尾不重排。
+const maxRefImages = 4
+
+// maxImageRefChars 单个参考图字符串的上限（字符数）。对齐参考项目
+// image-adapter 的 MAX_IMAGE_REF_CHARS：base64 膨胀 4/3，32M 字符 ≈ 24MB 原图，
+// 再大就不是「参考图」而是误传了整个文件。
+const maxImageRefChars = 32 << 20
+
+// refImageKeys 参考图字段，按优先级排列：官方客户端发 `images`（数组），
+// OpenAI 兼容客户端常发 `image`（字符串或数组）。两个都收，合并后去重。
+var refImageKeys = []string{"images", "image"}
 
 // imageEdits POST /v1/images/edits：OpenAI multipart 前门（也接受 JSON）。
 func (h *Handler) imageEdits(w http.ResponseWriter, r *http.Request) {
@@ -72,33 +92,22 @@ func parseImageFront(r *http.Request, requireImage bool) (map[string]any, error)
 			return nil, fmt.Errorf("请求体不是合法 JSON: %w", err)
 		}
 	}
-	images, err := imageList(payload["image"])
+	images, err := collectRefImages(payload)
 	if err != nil {
 		return nil, err
 	}
 	if len(images) == 0 && requireImage {
 		return nil, fmt.Errorf("image 不能为空：edits 需要至少一张参考图")
 	}
-	switch len(images) {
-	case 0:
-		delete(payload, "image")
-	case 1:
-		payload["image"] = images[0]
-	default:
-		arr := make([]any, len(images))
-		for i, s := range images {
-			arr[i] = s
-		}
-		payload["image"] = arr
+	if err := checkMask(payload, len(images)); err != nil {
+		return nil, err
 	}
-	if m, ok := payload["mask"].(string); ok && strings.TrimSpace(m) == "" {
-		delete(payload, "mask")
-	}
+	_ = applyRefImages(payload, images)
 	return payload, nil
 }
 
-// imageList 把 image 字段归一成非空字符串列表。
-// 支持 "url"、["url1","url2"]，以及空值（= 不传）。
+// imageList 把参考图字段归一成非空字符串列表。
+// 支持 "url"、["url1","url2"]、null（= 不传）；空串与超长元素直接报错。
 func imageList(v any) ([]string, error) {
 	switch x := v.(type) {
 	case nil:
@@ -106,30 +115,44 @@ func imageList(v any) ([]string, error) {
 	case string:
 		s := strings.TrimSpace(x)
 		if s == "" {
-			return nil, fmt.Errorf("image 不能是空字符串（不传图请省略该字段）")
+			return nil, fmt.Errorf("不能是空字符串（不传图请省略该字段或传 null）")
+		}
+		if len(s) > maxImageRefChars {
+			return nil, fmt.Errorf("单张超过 %d MB 上限", maxImageRefChars>>20)
 		}
 		return []string{s}, nil
 	case []string:
 		out := make([]string, 0, len(x))
 		for _, s := range x {
-			if strings.TrimSpace(s) == "" {
-				return nil, fmt.Errorf("image 数组里不能有空字符串")
+			s = strings.TrimSpace(s)
+			if s == "" {
+				return nil, fmt.Errorf("数组里不能有空字符串")
 			}
-			out = append(out, strings.TrimSpace(s))
+			if len(s) > maxImageRefChars {
+				return nil, fmt.Errorf("单张超过 %d MB 上限", maxImageRefChars>>20)
+			}
+			out = append(out, s)
 		}
 		return out, nil
 	case []any:
 		out := make([]string, 0, len(x))
 		for _, item := range x {
 			s, ok := item.(string)
-			if !ok || strings.TrimSpace(s) == "" {
-				return nil, fmt.Errorf("image 数组元素必须是非空字符串")
+			if !ok {
+				return nil, fmt.Errorf("数组元素必须是字符串（URL、data URI 或 base64）")
 			}
-			out = append(out, strings.TrimSpace(s))
+			s = strings.TrimSpace(s)
+			if s == "" {
+				return nil, fmt.Errorf("数组里不能有空字符串")
+			}
+			if len(s) > maxImageRefChars {
+				return nil, fmt.Errorf("单张超过 %d MB 上限", maxImageRefChars>>20)
+			}
+			out = append(out, s)
 		}
 		return out, nil
 	default:
-		return nil, fmt.Errorf("image 字段类型不支持（只接受字符串或字符串数组）")
+		return nil, fmt.Errorf("只接受字符串或字符串数组（URL、data URI 或 base64）")
 	}
 }
 
@@ -185,20 +208,13 @@ func parseMultipartImage(r *http.Request, requireImage bool) (map[string]any, er
 	if len(images) == 0 && requireImage {
 		return nil, fmt.Errorf("image 不能为空：edits 需要至少一张参考图")
 	}
-	switch len(images) {
-	case 0:
-	case 1:
-		payload["image"] = images[0]
-	default:
-		arr := make([]any, len(images))
-		for i, s := range images {
-			arr[i] = s
-		}
-		payload["image"] = arr
-	}
 	if mask != "" {
 		payload["mask"] = mask
 	}
+	if err := checkMask(payload, len(images)); err != nil {
+		return nil, err
+	}
+	_ = applyRefImages(payload, images)
 	if s, ok := payload["n"].(string); ok {
 		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil {
 			payload["n"] = n
@@ -207,48 +223,118 @@ func parseMultipartImage(r *http.Request, requireImage bool) (map[string]any, er
 	return payload, nil
 }
 
-// normalizeImageField 把 image 收敛成上游真正能吃下的形态，并返回给客户端看的
-// 警告码（空 = 无需告警）。
+// normalizeImageField 把参考图字段收敛成上游能吃的形态，返回给客户端看的警告码
+// （空 = 无需告警）。直通路径与两个前门共用同一套收敛。
 //
-// 实测口径（2026-10-22，doubao-seedream-5-lite，各 110 分/张）：
-//   - `"image": "url"`            → 忠实保留原图（dhash≈1，NCC≈0.998）
-//   - `"image": ["url"]`          → 单元素数组同样被丢参考图 → 出图与原图无关
-//   - `"image": ["a","b"]`        → 参考图**整体被丢弃**，退化成纯文生图
-//     （a,b 都出无关人脸；`["a","a"]` 也一样，与顺序无关）
-//
-// 所以：单元素数组压成字符串（这是「垫图不生效」的直接成因），多图取第一张
-// 并告警——宁可给用户一张保留了主体的图 + 明确的警告头，也不要静默吞掉 110 分
-// 出一张陌生脸。「多图合成」在本上游不存在。
-func normalizeImageField(payload map[string]any) string {
+// 输出形态：
+//   - 0 张：`image` / `images` 都删掉（别把空值当参考图送上去）；
+//   - 1 张：`image` 字符串——2026-10-22 实测有效（dhash≈1，NCC≈0.998）；
+//   - 多张：`images` 数组——官方客户端 0.9.38 的图生图形态。
+func normalizeImageField(payload map[string]any) (string, error) {
 	if payload == nil {
-		return ""
+		return "", nil
 	}
-	// 空白字符串：imageList 会当成「错误」以便 edits 前门回 400，
-	// 但直通路径上更合理的是视同没传图。
-	if s, ok := payload["image"].(string); ok && strings.TrimSpace(s) == "" {
-		delete(payload, "image")
-		return ""
-	}
-	images, err := imageList(payload["image"])
+	images, err := collectRefImages(payload)
 	if err != nil {
-		return "" // 类型不对就原样透传，让上游自己给出报错
+		return "", err
+	}
+	if err := checkMask(payload, len(images)); err != nil {
+		return "", err
+	}
+	return applyRefImages(payload, images), nil
+}
+
+// checkMask mask 只有配合参考图才有意义：没有 image 的 mask 上游要么 400、
+// 要么静默忽略，提前拒掉比让它变成一次没必要的上游调用清楚（与 image-adapter
+// 的 canonical 校验同口径）。
+func checkMask(payload map[string]any, imageCount int) error {
+	raw, exists := payload["mask"]
+	if !exists {
+		return nil
+	}
+	if raw == nil {
+		delete(payload, "mask") // null = 没有蒙版，别把空值送上游
+		return nil
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return fmt.Errorf("mask 必须是字符串（URL、data URI 或 base64）")
+	}
+	if strings.TrimSpace(s) == "" {
+		return fmt.Errorf("mask 不能是空字符串（没有蒙版请省略该字段）")
+	}
+	if len(s) > maxImageRefChars {
+		return fmt.Errorf("mask 超过 %d MB 上限", maxImageRefChars>>20)
+	}
+	if imageCount == 0 {
+		return fmt.Errorf("mask 需要配合 image 使用：没有参考图时不要传 mask")
+	}
+	if s != strings.TrimSpace(s) {
+		payload["mask"] = strings.TrimSpace(s)
+	}
+	return nil
+}
+
+// collectRefImages 合并 `images` 与 `image` 两个字段，保持出现顺序。
+// 去重只发生在「跨字段」：同一字段内的重复要留着，否则提示词里的「第二张」
+// 会因为两张图恰好相同而被悄悄抹掉下标。
+// 返回 error 表示字段形态不合法（类型不对、空串、单张超限）——调用方回 400，
+// 不要静默透传：`""` 这种「看起来传了图」的请求一旦放行，就变成一次纯文生图。
+func collectRefImages(payload map[string]any) ([]string, error) {
+	var out []string
+	seenFromPrev := make(map[string]struct{})
+	for _, key := range refImageKeys {
+		v, exists := payload[key]
+		if !exists {
+			continue
+		}
+		list, err := imageList(v)
+		if err != nil {
+			return nil, fmt.Errorf("%s 字段不合法：%w", key, err)
+		}
+		for _, s := range list {
+			if _, dup := seenFromPrev[s]; dup {
+				continue
+			}
+			out = append(out, s)
+		}
+		for _, s := range list {
+			seenFromPrev[s] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
+// applyRefImages 写入参考图字段并按上限截断，返回警告码。
+// 顺序敏感：提示词里的「第一张 / 第二张」依赖数组顺序，所以只截尾不重排。
+func applyRefImages(payload map[string]any, images []string) string {
+	warn := ""
+	if len(images) > maxRefImages {
+		warn = fmt.Sprintf("images-truncated-to-%d", maxRefImages)
+		images = images[:maxRefImages]
 	}
 	switch len(images) {
 	case 0:
 		delete(payload, "image")
+		delete(payload, "images")
 	case 1:
 		payload["image"] = images[0]
+		delete(payload, "images")
 	default:
-		payload["image"] = images[0]
-		return "multi-image-unsupported-used-first"
+		arr := make([]any, len(images))
+		for i, s := range images {
+			arr[i] = s
+		}
+		payload["images"] = arr
+		delete(payload, "image")
 	}
-	return ""
+	return warn
 }
 
 // imageNote 给日志补一句「这次请求带了参考图」，回退模型时能一眼看出
 // 是图生图被换了模型（换成不支持垫图的模型就是白扣分）。
 func imageNote(payload map[string]any) string {
-	images, err := imageList(payload["image"])
+	images, err := collectRefImages(payload)
 	if err != nil || len(images) == 0 {
 		return ""
 	}
@@ -301,7 +387,10 @@ func (c *captureWriter) Write(p []byte) (int, error) {
 // imageChat 图像模型的 /v1/chat/completions 前门。
 func (h *Handler) imageChat(w http.ResponseWriter, r *http.Request, req map[string]any, model string) {
 	prompt, images := chatPromptImages(req)
-	payload := imagePayload(req, model, prompt, images)
+	payload, warn := imagePayload(req, model, prompt, images)
+	if warn != "" {
+		w.Header().Set("X-Loomy-Image-Warn", warn)
+	}
 	code, out := h.generateImageCaptured(r, payload)
 	if code != http.StatusOK {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -335,7 +424,10 @@ func (h *Handler) imageChat(w http.ResponseWriter, r *http.Request, req map[stri
 // imageResponses 图像模型的 /v1/responses 前门。
 func (h *Handler) imageResponses(w http.ResponseWriter, r *http.Request, req map[string]any, model string) {
 	prompt, images := responsesPromptImages(req)
-	payload := imagePayload(req, model, prompt, images)
+	payload, warn := imagePayload(req, model, prompt, images)
+	if warn != "" {
+		w.Header().Set("X-Loomy-Image-Warn", warn)
+	}
 	code, out := h.generateImageCaptured(r, payload)
 	if code != http.StatusOK {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -407,7 +499,7 @@ func chatPromptImages(req map[string]any) (string, []string) {
 					if s := str(part["text"]); strings.TrimSpace(s) != "" {
 						texts = append(texts, s)
 					}
-				case "image_url", "input_image":
+				case "image_url", "input_image", "image":
 					if u := imageURLOf(part); u != "" {
 						images = append(images, u)
 					}
@@ -449,12 +541,27 @@ func responsesPromptImages(req map[string]any) (string, []string) {
 	return joinPrompt(texts), images
 }
 
+// imageURLOf 从内容块里取图片引用，兼容各家拼法（与 image-adapter 的
+// _IMAGE_PART_TYPES / _image_ref 同口径）：
+//
+//	{"type":"image_url","image_url":{"url":"…"}}   OpenAI chat
+//	{"type":"input_image","image_url":"…"}         OpenAI responses
+//	{"type":"image","image":"…"}                   部分客户端
+//	{"type":"image","image":{"url":"…"}}           同上，对象形态
+//
+// 值可以是字符串（URL / data URI / base64），也可以是带 url 的对象。
 func imageURLOf(part map[string]any) string {
-	switch v := part["image_url"].(type) {
-	case string:
-		return strings.TrimSpace(v)
-	case map[string]any:
-		return strings.TrimSpace(str(v["url"]))
+	for _, key := range []string{"image_url", "image", "url"} {
+		switch v := part[key].(type) {
+		case string:
+			if s := strings.TrimSpace(v); s != "" {
+				return s
+			}
+		case map[string]any:
+			if s := strings.TrimSpace(str(v["url"])); s != "" {
+				return s
+			}
+		}
 	}
 	return ""
 }
@@ -467,23 +574,13 @@ func joinPrompt(parts []string) string {
 	return s
 }
 
-func imagePayload(req map[string]any, model, prompt string, images []string) map[string]any {
+// imagePayload 组装生成请求，返回给客户端看的警告码（参考图被截断时非空）。
+func imagePayload(req map[string]any, model, prompt string, images []string) (map[string]any, string) {
 	p := map[string]any{"model": model, "prompt": prompt}
-	switch len(images) {
-	case 0:
-	case 1:
-		p["image"] = images[0]
-	default:
-		arr := make([]any, len(images))
-		for i, s := range images {
-			arr[i] = s
-		}
-		p["image"] = arr
-	}
-	// 多图在本上游不吃（见 normalizeImageField）：聊天前门也走同一条收敛，
-	// 只保留第一张，别再让上游静默丢图。
-	if warn := normalizeImageField(p); warn != "" {
-		log.Printf("[image] 对话前门带多张参考图；上游只支持单图垫图，已改用第一张（%s）", warn)
+	// 与直通路径同一套收敛：1 张走 image 字符串，多张走 images 数组。
+	warn := applyRefImages(p, images)
+	if warn != "" {
+		log.Printf("[image] 对话前门参考图超过 %d 张，已截断（%s）", maxRefImages, warn)
 	}
 	if n, ok := req["n"]; ok {
 		p["n"] = n
@@ -491,7 +588,7 @@ func imagePayload(req map[string]any, model, prompt string, images []string) map
 	if s := str(req["size"]); s != "" {
 		p["size"] = s
 	}
-	return p
+	return p, warn
 }
 
 func imageURLs(out []byte) ([]string, int64) {

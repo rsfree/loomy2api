@@ -66,7 +66,7 @@ Loomy2API 是一个自托管的**反向代理网关**，把讯飞 Loomy（`loomy
 | 🆓 **限免与倍率识别** | 上游 `/models` 没有结构化倍率字段，倍率与「限时免费」都写在展示名里（`Spark-X2.6-preview(限时免费)(x0.0)`），网关解析后由面板渲染「限免」标签 |
 | 🖼️ **图像模型多端点** | `type=image` 的模型支持 `/v1/images/generations`、`/v1/images/edits`（multipart / JSON），也可走 `/v1/chat/completions` 与 `/v1/responses` 前门（自动折成 prompt + 参考图），支持单图与**多图数组** |
 | 🪄 **生图模型自动归并** | 生图端点（`generations` / `edits`）先精确匹配目录，未命中再按**家族前缀**找同族图像模型（`doubao-seedream-4-0-250828` → `doubao-seedream-5-lite`、`qwen-image-2.5` → `qwen-image-3.0-pro`，同族取版本最高），最后才用 `image_fallback_model` 兜底。对话端点仍严格 404，不会把拼错的对话模型变成一次生图 |
-| 🧹 **生图 400 自动精简** | 客户端把 Seedream 4.5 / 新版生图参数原样发来时（`stream`、`sequential_image_generation`、`watermark`、`seed`、`n>1`），下游 provider 会回「请求有误」；网关自动去掉非核心字段重试，仍失败再退到 `model/prompt/image/size`，并把被丢字段写进日志 |
+| 🧹 **生图 400 自动精简** | 客户端把 Seedream 4.5 / 新版生图参数原样发来时（`stream`、`sequential_image_generation`、`watermark`、`seed`、`n>1`），下游 provider 会回「请求有误」；网关自动去掉非核心字段重试，仍失败再退到 `model/prompt/image(images)/size`（参考图字段始终保留），并把被丢字段写进日志 |
 | 🔄 **多账号池** | 余额加权 + 成本分层 + 加权随机选号，Top-5 候选 + 防惊群；**每日赠送额度优先**（按自然日清零的那份先花） |
 | 🛡️ **熔断与冷却** | 429 软冷却指数退避（封顶可配）、404 短冷却、额度耗尽硬冷却到次日 00:00、连败熔断、单号在途租约 |
 | 🧲 **会话粘性** | 同一会话绑定同一账号，TTL 滚动续期，失败自动解绑；用**最后一条 user 消息**派生会话键，多轮对话不会永久锁死单号 |
@@ -174,8 +174,8 @@ curl http://127.0.0.1:17890/v1/responses \
 | POST | `/v1/messages` | Anthropic | Claude Code 等（也接受 `/messages`） |
 | GET | `/v1/models` | OpenAI | 模型目录（上游优先，失败回落内置表）；图像模型带 `endpoint` / `supports_chat=false` |
 | POST | `/v1/embeddings` | OpenAI | 向量 |
-| POST | `/v1/images/generations` | OpenAI | 生图 / 图生图（`image` 支持 URL、data URI，**单图**；多图会被上游丢弃，网关只取第一张并回 `X-Loomy-Image-Warn`） |
-| POST | `/v1/images/edits` | OpenAI | 同上，multipart 前门（`image` / `image[]` 文件、`mask`） |
+| POST | `/v1/images/generations` | OpenAI | 生图 / 图生图；参考图接受 `image` 与 `images`，**多图 = `images` 数组**（上限 4 张，超限截尾并回 `X-Loomy-Image-Warn`） |
+| POST | `/v1/images/edits` | OpenAI | 同上，multipart 前门（`image` / `image[]` / `images[]` 文件、`mask`） |
 | POST | `/v1/search` | — | 内置联网检索通道 |
 | GET | `/v1/points` | — | 全池额度 |
 | GET | `/status` | — | 账号池状态（需鉴权） |
@@ -193,24 +193,70 @@ curl http://127.0.0.1:17890/v1/responses \
 
 鉴权同时接受 `Authorization: Bearer <key>` 与 `x-api-key: <key>`。
 
-### 生图三个坑（上游都是**静默**处理，不报错）
+### 生图：参考图字段的真实形态
 
-1. **`image` 只能单图，且要传字符串**（实测 2026-10-22，5-lite，逐张 110 分）：
+**多图走 `images`（复数）数组**，不是 `image`。这就是官方客户端 0.9.38 的图生图请求体
+（`electron/image/image-generation-service.js`，配套单测逐字节断言过）：
 
-   | 请求形态 | 结果 |
-   |---|---|
-   | `"image": "url"` | 忠实垫图（dhash≈1，NCC≈0.998，就是原图的高清版） |
-   | `"image": ["url"]` | 参考图被丢，出图与原图无关 |
-   | `"image": ["a","b"]` / `["b","a"]` / `["a","a"]` | 参考图被**整体丢弃**，退化成纯文生图（出无关人脸） |
+```json
+{
+  "model": "doubao-seedream-5-lite",
+  "prompt": "把这两张图合成一张海报",
+  "images": ["https://example.com/product.png", "data:image/png;base64,iVBORw0..."],
+  "n": 1,
+  "size": "2304x1728",
+  "response_format": "url"
+}
+```
 
-   即上游**没有多图合成能力**，数组形态等于没传图。网关现在把单元素数组压成字符串、
-   多图只取第一张，并在响应头挂 `X-Loomy-Image-Warn: multi-image-unsupported-used-first`
-   —— 宁可给你一张保住主体的图 + 明确警告，也不静默吞掉 110 分出一张陌生脸。
-2. **模型名被静默替换**：目录外的名字（如 `doubao-seedream-5-0-260128`）会按家族前缀回退到同族
+- 数组元素可以是 URL、data URI，**两者可混用**；
+- 前端上传上限 **4 张**（main bundle 常量 `Cu=4`，超出提示「最多上传 4 张图片」）；
+- 顺序即提示词里的「第一张 / 第二张」，网关只截尾、不重排。
+
+网关两种字段都收，转发前统一收敛成上游认识的形态：
+
+| 客户端传 | 发给上游 | 说明 |
+|---|---|---|
+| `"image": "url"` | `"image": "url"` | 单图，2026-10-22 实测有效（dhash≈1，NCC≈0.998） |
+| `"images": ["a","b"]` | `"images": ["a","b"]` | 与官方客户端一致（单图发数组也行，会压成字符串） |
+| `"image": ["a","b"]` | `"images": ["a","b"]` | 旧形态自动升级；上游对 `image` 传数组是静默忽略的 |
+| 超过 4 张 | 只发前 4 张 | 响应头 `X-Loomy-Image-Warn: images-truncated-to-4` |
+| `"image": null` / `[]` | 两个字段都删 | 明确表示「文生图」（OpenAI SDK 常这么发） |
+| `"image": ""` 或数组含空串 | — | **400**：空串是写错了，不是没传图（同 image-adapter） |
+| 单张 > 32M 字符 | — | **400**：单张上限（base64 膨胀 4/3，≈24MB 原图） |
+| `mask` 但没参考图 | — | **400**：mask 必须搭配 `image` |
+
+参考图元素支持三种形态：远程 URL、`data:image/...;base64,`、裸 base64；
+上游按原样接收，网关只做字段与张数收口（校验规则对齐 `image-adapter` 的
+`validate_images_body`：字符串或字符串数组、`null`/`[]` 视为没有图、空串拒绝、
+单张 32M 字符上限、`mask` 依赖 `image`）。
+
+`/v1/images/edits` 的 multipart 前门同理：`image` / `image[]` / `images[]` 文件按 part
+顺序转 data URI，再进同一个数组；空 part 视同没传。
+
+对话前门（`/v1/chat/completions`、`/v1/responses`）认三种图片块拼法——
+`image_url` / `input_image` / `image`，值可以是字符串，也可以是 `{"url": "..."}`。
+
+```bash
+# 多图合成：把两张参考图交给同一个模型
+curl http://127.0.0.1:17890/v1/images/generations \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"doubao-seedream-5-lite","prompt":"把第一张图的产品放进第二张图的场景里",
+       "images":["https://example.com/product.png","https://example.com/room.jpg"]}'
+```
+
+> ⚠️ 历史坑：2026-10-22 曾拿 `image` 传数组做实测，`["a","b"]` 全部退化成纯文生图
+> （出无关人脸，各扣 110 分），据此写下「上游没有多图能力」。**结论错在字段名**——
+> 上游读的是复数 `images`；单数 `image` 只认字符串。
+
+### 生图另外两个坑（上游都是**静默**处理，不报错）
+
+1. **模型名被静默替换**：目录外的名字（如 `doubao-seedream-5-0-260128`）会按家族前缀回退到同族
    最高版（常见是 `doubao-seedream-5-lite`）。换模型后图生图能力未必还在。回退现在会回显在
    响应头 `X-Loomy-Model-Fallback: <请求名> -> <实际名>`，实际模型见 `X-Loomy-Model`；
    不想被回退就开 `strict_model_check`，让目录外的名字直接 404。
-3. **`sequential_image_generation`**：这是组图开关（`auto` + `max_images`），超分 / 保主体这类
+2. **`sequential_image_generation`**：这是组图开关（`auto` + `max_images`），超分 / 保主体这类
    单图图生图场景建议不要带，容易让上游走进「一次出多张」的分支。
 
 ## 配置

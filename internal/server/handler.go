@@ -973,10 +973,17 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 		}
 		var model string
 		if kind == "image" {
-			// 参考图先归一（见 normalizeImageField）：上游对 image 数组不报错但会
-			// 静默丢弃参考图，必须在转发前把形态收敛掉。
-			if warn := normalizeImageField(payload); warn != "" {
-				log.Printf("[image] 请求带多张参考图；上游只支持单图垫图，已改用第一张（%s）", warn)
+			// 参考图先归一（见 normalizeImageField）：单图走 image 字符串，
+			// 多图走 images 数组（官方客户端形态），超过上限按客户端口径截断。
+			// 形态不合法（空串、非字符串元素、mask 没有配图）在这里就 400，
+			// 不把「看起来带了图」的请求放给上游变成一次纯文生图。
+			warn, err := normalizeImageField(payload)
+			if err != nil {
+				writeErr(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+				return
+			}
+			if warn != "" {
+				log.Printf("[image] 参考图超过 %d 张，已按官方客户端口径截断（%s）", maxRefImages, warn)
 				w.Header().Set("X-Loomy-Image-Warn", warn)
 			}
 			var replaced string
