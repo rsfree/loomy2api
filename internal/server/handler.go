@@ -388,6 +388,17 @@ func (h *Handler) chatOnce(w http.ResponseWriter, r *http.Request, req map[strin
 		resp, err := h.Upstream.Do(r.Context(), http.MethodPost, "chat/completions", acc.Session, req, extra)
 		if err != nil {
 			h.Pool.Release(acc)
+			// 客户端断开/连接超时都不是账号的问题，不罚号（见 abort.go）。
+			if clientGone(r) {
+				lastStatus, lastBody = statusClientClosed, abortClientGoneBody
+				h.logCall(acc, model, statusClientClosed, time.Since(started), "客户端断开", r)
+				break
+			}
+			if attemptTimedOut(err, nil) {
+				lastStatus, lastBody = http.StatusGatewayTimeout, abortConnectTimeoutBody
+				h.logCall(acc, model, http.StatusGatewayTimeout, time.Since(started), "同步连接超时: "+err.Error(), r)
+				continue
+			}
 			h.Pool.ReportFailure(acc, 0, err.Error(), skey, model)
 			lastStatus, lastBody = http.StatusBadGateway, err.Error()
 			h.logCall(acc, model, 0, time.Since(started), "sync 连接异常: "+err.Error(), r)
@@ -488,9 +499,10 @@ func (h *Handler) chatAggregated(w http.ResponseWriter, r *http.Request, req map
 
 	obj, err := h.collectStream(r.Context(), r, sreq, model, skey, extra)
 	if err != nil {
-		h.noteFail(r, "chat", model, nil, http.StatusBadGateway, err.Error(), started)
+		st := abortStatus(err)
+		h.noteFail(r, "chat", model, nil, st, err.Error(), started)
 		writeJSON(w, map[string]any{"error": map[string]any{
-			"message": err.Error(), "type": "upstream_error", "code": 502,
+			"message": err.Error(), "type": "upstream_error", "code": st,
 		}})
 		return
 	}
@@ -525,6 +537,15 @@ func (h *Handler) collectStream(ctx context.Context, r *http.Request, req map[st
 		resp, err := h.Upstream.Do(ctx, http.MethodPost, "chat/completions", acc.Session, upReq, extra)
 		if err != nil {
 			h.Pool.Release(acc)
+			// 客户端断开 → 停；连接超时 → 换号再试但不算账号故障（见 abort.go）。
+			if clientGone(r) {
+				lastErr = errClientGone
+				break
+			}
+			if attemptTimedOut(err, nil) {
+				lastErr = errConnectTimeout
+				continue
+			}
 			h.Pool.ReportFailure(acc, 0, err.Error(), skey, model)
 			lastErr = err
 			continue
@@ -592,6 +613,14 @@ func (h *Handler) chatStream(w http.ResponseWriter, r *http.Request, req map[str
 		resp, err := h.Upstream.Do(r.Context(), http.MethodPost, "chat/completions", acc.Session, req, extra)
 		if err != nil {
 			h.Pool.Release(acc)
+			if clientGone(r) {
+				lastStatus, lastBody = statusClientClosed, abortClientGoneBody
+				break
+			}
+			if attemptTimedOut(err, nil) {
+				lastStatus, lastBody = http.StatusGatewayTimeout, abortConnectTimeoutBody
+				continue
+			}
 			h.Pool.ReportFailure(acc, 0, err.Error(), skey, model)
 			lastStatus, lastBody = http.StatusBadGateway, err.Error()
 			continue
@@ -710,7 +739,7 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	}
 	obj, err := h.collectStream(r.Context(), r, chatReq, model, skey, extra)
 	if err != nil {
-		h.fail(w, r, "responses", model, nil, http.StatusBadGateway, err.Error(), started)
+		h.fail(w, r, "responses", model, nil, abortStatus(err), err.Error(), started)
 		return
 	}
 	writeJSON(w, bridge.ChatToResponse(obj, model))
@@ -851,8 +880,9 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	obj, err := h.collectStream(r.Context(), r, chatReq, model, skey, extra)
 	if err != nil {
-		h.noteFail(r, "messages", model, nil, http.StatusBadGateway, err.Error(), started)
-		writeAnthropicErr(w, http.StatusBadGateway, err.Error())
+		st := abortStatus(err)
+		h.noteFail(r, "messages", model, nil, st, err.Error(), started)
+		writeAnthropicErr(w, st, err.Error())
 		return
 	}
 	writeJSON(w, bridge.ToAnthropic(obj, model))
@@ -1046,20 +1076,30 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 			}
 			attemptStart := time.Now()
 			resp, err := h.Upstream.Do(ctx, http.MethodPost, suffix, acc.Session, payload, nil)
+			attemptErr := ctx.Err() // 必须早于 cancel()：之后恒为 context.Canceled
 			cancel()
 			if err != nil {
 				h.Pool.Release(acc)
-				// 预算耗尽不是账号的错：上游排队时换号也一样排队，不罚账号。
-				if errors.Is(err, context.DeadlineExceeded) {
+				// 三种失败分开记，只有第三种才罚账号：
+				//   1) 单次尝试上限到期（上游排队）→ 504，换号也一样排队；
+				//   2) 调用方已断开 → 499，重试毫无意义，必须立刻停；
+				//   3) 真连接故障（TLS 超时 / reset / EOF）→ 502，换号重试。
+				// 旧实现把 1、2 都当第三种：一次客户端放弃会连着罚掉 MaxRetries+1 个号。
+				switch {
+				case attemptTimedOut(err, attemptErr):
 					lastStatus = http.StatusGatewayTimeout
-					lastBody = `{"error":{"message":"单次生图超过 900s 仍无响应，请稍后重试","type":"timeout_error","param":null,"code":504}}`
-					h.logCall(acc, model, http.StatusGatewayTimeout, time.Since(started), "单次尝试超时", r)
+					lastBody = fmt.Sprintf(`{"error":{"message":"单次生图超过 %.0fs 仍无响应，请稍后重试","type":"timeout_error","param":null,"code":504}}`, imageAttemptCap.Seconds())
+					h.logCall(acc, model, lastStatus, time.Since(started), "单次尝试超时", r)
 					log.Printf("[image] 单次尝试超过 %s，放弃请求（已耗时 %.0fs）", imageAttemptCap, time.Since(started).Seconds())
-					break
+				case clientGone(r):
+					lastStatus, lastBody = statusClientClosed, abortClientGoneBody
+					h.logCall(acc, model, statusClientClosed, time.Since(started), "客户端断开", r)
+				default:
+					h.Pool.ReportFailure(acc, 0, err.Error(), "", model)
+					lastStatus, lastBody = http.StatusBadGateway, err.Error()
+					continue
 				}
-				h.Pool.ReportFailure(acc, 0, err.Error(), "", model)
-				lastStatus, lastBody = http.StatusBadGateway, err.Error()
-				continue
+				break
 			}
 			// 生图 400 多为客户端带了下游 provider 不认的扩展字段（见 imageslim.go）：
 			// 第一次先按白名单减肥重试，避免把「请求有误」直接抛给用户。
