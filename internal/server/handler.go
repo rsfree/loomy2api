@@ -394,11 +394,6 @@ func (h *Handler) chatOnce(w http.ResponseWriter, r *http.Request, req map[strin
 				h.logCall(acc, model, statusClientClosed, time.Since(started), "客户端断开", r)
 				break
 			}
-			if attemptTimedOut(err, nil) {
-				lastStatus, lastBody = http.StatusGatewayTimeout, abortConnectTimeoutBody
-				h.logCall(acc, model, http.StatusGatewayTimeout, time.Since(started), "同步连接超时: "+err.Error(), r)
-				continue
-			}
 			h.Pool.ReportFailure(acc, 0, err.Error(), skey, model)
 			lastStatus, lastBody = http.StatusBadGateway, err.Error()
 			h.logCall(acc, model, 0, time.Since(started), "sync 连接异常: "+err.Error(), r)
@@ -542,10 +537,6 @@ func (h *Handler) collectStream(ctx context.Context, r *http.Request, req map[st
 				lastErr = errClientGone
 				break
 			}
-			if attemptTimedOut(err, nil) {
-				lastErr = errConnectTimeout
-				continue
-			}
 			h.Pool.ReportFailure(acc, 0, err.Error(), skey, model)
 			lastErr = err
 			continue
@@ -616,10 +607,6 @@ func (h *Handler) chatStream(w http.ResponseWriter, r *http.Request, req map[str
 			if clientGone(r) {
 				lastStatus, lastBody = statusClientClosed, abortClientGoneBody
 				break
-			}
-			if attemptTimedOut(err, nil) {
-				lastStatus, lastBody = http.StatusGatewayTimeout, abortConnectTimeoutBody
-				continue
 			}
 			h.Pool.ReportFailure(acc, 0, err.Error(), skey, model)
 			lastStatus, lastBody = http.StatusBadGateway, err.Error()
@@ -1086,7 +1073,7 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 				//   3) 真连接故障（TLS 超时 / reset / EOF）→ 502，换号重试。
 				// 旧实现把 1、2 都当第三种：一次客户端放弃会连着罚掉 MaxRetries+1 个号。
 				switch {
-				case attemptTimedOut(err, attemptErr):
+				case attemptCapExpired(attemptErr):
 					lastStatus = http.StatusGatewayTimeout
 					lastBody = fmt.Sprintf(`{"error":{"message":"单次生图超过 %.0fs 仍无响应，请稍后重试","type":"timeout_error","param":null,"code":504}}`, imageAttemptCap.Seconds())
 					h.logCall(acc, model, lastStatus, time.Since(started), "单次尝试超时", r)

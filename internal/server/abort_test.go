@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rsfree/loomy2api/internal/pool"
 )
 
 // queuedUpstream 一个「排队中」的上游：不主动返回，只等测试放行或客户端断开。
@@ -125,14 +127,22 @@ func TestChatClientGoneIs499NotPunished(t *testing.T) {
 	}
 }
 
-// TestAbortStatusMapping 三个哨兵错误映射成对外状态码。
+// fakeTimeoutError 模拟 transport 层的超时（TLSHandshakeTimeout / dial i/o timeout）：
+// 它实现 net.Error 且 Timeout() = true，但不是我们自己的 ctx 到期。
+type fakeTimeoutError struct{}
+
+func (fakeTimeoutError) Error() string   { return "net/http: TLS handshake timeout" }
+func (fakeTimeoutError) Timeout() bool   { return true }
+func (fakeTimeoutError) Temporary() bool { return true }
+
+// TestAbortStatusMapping 只有「客户端断开」映射成 499，其余一律 502。
 func TestAbortStatusMapping(t *testing.T) {
 	cases := []struct {
 		err  error
 		want int
 	}{
 		{errClientGone, statusClientClosed},
-		{errConnectTimeout, http.StatusGatewayTimeout},
+		{fakeTimeoutError{}, http.StatusBadGateway},
 		{context.DeadlineExceeded, http.StatusBadGateway},
 		{io.EOF, http.StatusBadGateway},
 	}
@@ -143,15 +153,64 @@ func TestAbortStatusMapping(t *testing.T) {
 	}
 }
 
-// TestAttemptTimedOut 三种超时措辞都要认，客户端取消（Canceled）不能算超时。
-func TestAttemptTimedOut(t *testing.T) {
-	if !attemptTimedOut(nil, context.DeadlineExceeded) {
-		t.Error("attempt ctx 到期应判超时")
+// TestAttemptCapExpired 只有我们自己的 ctx 到期才算 cap 超时。
+// 0.0.34 的回归就是把 net.Error.Timeout() 也算了进来，导致 TLS 握手超时
+// （15s）在第一次尝试就被判死成 504，换号重试被跳过。
+func TestAttemptCapExpired(t *testing.T) {
+	if !attemptCapExpired(context.DeadlineExceeded) {
+		t.Error("自己的 ctx 到期应判 cap 超时")
 	}
-	if !attemptTimedOut(context.DeadlineExceeded, nil) {
-		t.Error("err 包装 DeadlineExceeded 应判超时")
+	if attemptCapExpired(context.Canceled) {
+		t.Error("客户端取消不该判成 cap 超时（否则会把断开记成 504）")
 	}
-	if attemptTimedOut(context.Canceled, context.Canceled) {
-		t.Error("客户端取消不该判成超时（否则会把断开记成 504）")
+	if attemptCapExpired(nil) {
+		t.Error("没有 ctx 错误时不该判成 cap 超时")
+	}
+	if attemptCapExpired(fakeTimeoutError{}) {
+		t.Error("传输层超时不是 cap 超时：它必须继续走换号重试")
+	}
+}
+
+// TestConnFaultStillRetries 连接层故障（EOF / reset）必须换号重试并最终 502、
+// 且计入账号 failures；不能像 0.0.34 那样第一次尝试就判死成 504。
+//
+// 注意：upstream 客户端的 Client.Timeout 恒为 0（长思考不许被掐断），所以这里
+// 用「上游直接掐断连接」制造 url.Error，而不是靠客户端超时来模拟。
+func TestConnFaultStillRetries(t *testing.T) {
+	fs := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"doubao-seedream-5-lite","type":"image"}]}`)
+			return
+		}
+		if hj, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hj.Hijack(); err == nil {
+				_ = conn.Close() // 连接直接断：客户端拿到 EOF
+				return
+			}
+		}
+		w.WriteHeader(http.StatusBadGateway)
+	})
+	h, p, _ := newTestHandler(t, fs.srv.URL, nil)
+	prewarm(t, h)
+	// 换号重试要有号可换：再塞一个，否则第一次失败就会因「没有其他账号」退出。
+	bal := int64(1000)
+	p.Add(&pool.Account{
+		Name: "acc2", Enabled: true, Session: "sess-2",
+		ExpireAt: time.Now().Add(24 * time.Hour).Unix(), Available: &bal, LoginID: "13800000001",
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"doubao-seedream-5-lite","prompt":"a cat"}`))
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("状态码 %d，期望 502（不是 504）：%s", w.Code, w.Body.String())
+	}
+	if got := imageHits(fs); got != 2 { // MaxRetries=1 ⇒ 两次尝试
+		t.Errorf("连接故障应换号重试，上游被打了 %d 次", got)
+	}
+	if acc := p.All()[0]; acc.Failures == 0 {
+		t.Error("连接故障应计入账号 failures（否则坏出口永远轮不到冷却）")
 	}
 }
